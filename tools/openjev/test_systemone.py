@@ -92,10 +92,65 @@ class HandleTests(unittest.TestCase):
     def test_aliases(self):
         self.assertEqual(canonical_id("jev-latest"), "openjev_4b")
         self.assertEqual(canonical_id("openjev_0.8b"), "openjev_0.8b")
+        self.assertEqual(canonical_id("kev-latest"), "kev_4b")
+        self.assertEqual(canonical_id("kev-0.8b"), "kev_0.8b")
+
+    def test_kev_choice_uses_pointer_options(self):
+        def get_encoder(name):
+            canonical_id(name)
+            jev = Mock()
+
+            def fake_request(payload):
+                self.assertIn("questions", payload)
+                self.assertEqual(payload["questions"][0]["options"][0], "red: red")
+                return {
+                    "results": [{"probabilities": [0.2, 0.8]}],
+                    "evaluated_tokens": 9,
+                }
+
+            jev.request.side_effect = fake_request
+            return jev
+
+        out = handle_request(get_encoder, {
+            "state": "The door is red.",
+            "model": "kev_4b",
+            "questions": {
+                "foo": {
+                    "type": "choice",
+                    "instructions": "What colour is the door?",
+                    "criteria": {"red": "red", "blue": "blue"},
+                }
+            },
+        })
+        self.assertEqual(out["answers"]["foo"]["choice"], "blue")
+        self.assertAlmostEqual(out["answers"]["foo"]["probabilities"]["blue"], 0.8)
+        self.assertEqual(out["usage"]["input_tokens"], 9)
+
+    def test_kev_noul_is_yes_mass(self):
+        def get_encoder(name):
+            canonical_id(name)
+            jev = Mock()
+            jev.request.return_value = {
+                "results": [{"probabilities": [0.25, 0.75]}],
+                "evaluated_tokens": 4,
+            }
+            return jev
+
+        out = handle_request(get_encoder, {
+            "state": "ok",
+            "model": "kev-latest",
+            "questions": {"q": {"type": "noul", "instructions": "Is it ok?"}},
+        })
+        self.assertAlmostEqual(out["answers"]["q"]["noul"], 0.75)
 
     def test_softmax(self):
         weights = softmax([0.0, 0.0])
         self.assertAlmostEqual(weights[0], 0.5)
+
+    def test_catalog_has_no_auto_install_flag(self):
+        from openjev_server import CATALOG
+        for spec in CATALOG.values():
+            self.assertNotIn("auto", spec)
 
 
 if __name__ == "__main__":
