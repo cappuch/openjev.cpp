@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import threading
 from pathlib import Path
@@ -12,7 +13,11 @@ class OpenJevCrossEncoder:
     """Load a GGUF once and score requests over JSONL. Use as a context manager."""
 
     def __init__(self, model, *, binary=None, mmproj=None, ctx_size=4096,
-                 batch_size=512, threads=4, gpu_layers=99, prefix_cache=True, latents=False):
+                 batch_size=512, threads=4, gpu_layers=99, prefix_cache=True, latents=False,
+                 inference_timeout=110.0):
+        if not math.isfinite(inference_timeout) or inference_timeout <= 0:
+            raise ValueError("inference_timeout must be positive")
+        self.inference_timeout = inference_timeout
         binary = binary or Path(__file__).resolve().parent / "build" / "bin" / "openjev"
         command = [str(binary), "-m", str(model), "-c", str(ctx_size), "-b", str(batch_size),
                    "-t", str(threads), "-ngl", str(gpu_layers)]
@@ -32,18 +37,36 @@ class OpenJevCrossEncoder:
         with self._lock:
             if self._process.poll() is not None:
                 raise RuntimeError(f"openjev exited with status {self._process.returncode}; see stderr")
+            expired = threading.Event()
+            def expire():
+                expired.set()
+                self._process.kill()
+            watchdog = threading.Timer(self.inference_timeout, expire)
+            watchdog.daemon = True
+            watchdog.start()
             try:
-                self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                self._process.stdin.flush()
-            except BrokenPipeError as exc:
-                raise RuntimeError("openjev closed its input; see stderr") from exc
-            line = self._process.stdout.readline()
+                try:
+                    self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    self._process.stdin.flush()
+                    line = self._process.stdout.readline()
+                except BrokenPipeError as exc:
+                    if not expired.is_set():
+                        raise RuntimeError("openjev closed its input; see stderr") from exc
+            finally:
+                watchdog.cancel()
+                watchdog.join()
+            if expired.is_set():
+                self._process.wait()
+                raise TimeoutError(f"inference exceeded {self.inference_timeout:g}s; encoder stopped")
             if not line:
                 raise RuntimeError("openjev exited without a response; see stderr")
             result = json.loads(line)
             if "error" in result:
                 raise ValueError(result["error"])
             return result
+
+    def is_alive(self):
+        return self._process.poll() is None
 
     def _rows(self, payload, *, latent=False):
         if latent != self._latents:

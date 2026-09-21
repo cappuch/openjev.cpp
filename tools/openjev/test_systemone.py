@@ -218,6 +218,147 @@ class HandleTests(unittest.TestCase):
         for spec in CATALOG.values():
             self.assertNotIn("auto", spec)
 
+    def test_image_batch_matches_separate_questions(self):
+        import base64
+        import hashlib
+        from openjev_server import evaluate_question, question_pairs
+
+        def score(payload):
+            pairs = question_pairs(payload)
+            rows = [{"logits": [0.2, hashlib.sha256(repr(pair).encode()).digest()[0] / 40, -0.1]}
+                    for pair in pairs]
+            return {"results": rows, "evaluated_tokens": len(rows) * 10}
+
+        self.jev.request.side_effect = score
+        questions = {
+            "done": {"type": "noul", "instructions": "Is it done?"},
+            "risk": {"type": "noul", "instructions": "Is it sensitive?",
+                     "criteria": {"true": "yes", "false": "no"}},
+            "target": {"type": "choice", "instructions": "Which target?",
+                       "criteria": {"a": "search", "b": "tab", "skip": None}},
+            "score": {"type": "score", "instructions": "Quality?", "criteria": ["bad", "good"]},
+        }
+        expected = {qid: evaluate_question(self.jev, "screen", question)[0]
+                    for qid, question in questions.items()}
+        self.jev.reset_mock()
+        out = handle_request(self.get_encoder, {
+            "model": "openjev_0.8b", "state": "screen", "questions": questions,
+            "image": {"type": "image", "media_type": "image/png",
+                      "data": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()},
+        })
+        self.jev.request.assert_called_once()
+        self.assertEqual(out["answers"], expected)
+        self.assertEqual(out["usage"]["input_tokens"], 70)
+
+
+class InferenceLifecycleTests(unittest.TestCase):
+    def test_async_job_returns_before_inference_finishes(self):
+        import http.client
+        import json
+        import threading
+        import time
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from openjev_server import make_handler
+        entered, release = threading.Event(), threading.Event()
+        store, hub = Mock(), Mock()
+        store.find_key.return_value = {"id": "test"}
+        store.needs_setup.return_value = False
+        hub.ready_ids.return_value = []
+        hub._loaded = {}
+        def infer(*args):
+            entered.set(); release.wait(3)
+            return {"answers": {}, "usage": {}}
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(hub, store))
+        runner = threading.Thread(target=server.serve_forever); runner.start()
+        def request(path, body="{}"):
+            conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+            conn.request("POST", path, body=body, headers={"Authorization": "Bearer key", "Content-Type": "application/json"})
+            result = conn.getresponse(); data = json.loads(result.read()); conn.close()
+            return result.status, data
+        try:
+            with patch("openjev_server.handle_request", side_effect=infer):
+                status, job = request("/v1/systemone?async=1")
+                self.assertEqual(status, 202)
+                self.assertIn(job["status"], {"queued", "running"})
+                self.assertTrue(entered.wait(2))
+                release.set()
+                for _ in range(30):
+                    conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+                    conn.request("GET", "/v1/jobs/" + job["id"])
+                    result = conn.getresponse(); data = json.loads(result.read()); conn.close()
+                    if data["status"] == "done": break
+                    time.sleep(.02)
+                self.assertEqual(data["status"], "done")
+        finally:
+            release.set(); server.shutdown(); server.server_close(); runner.join()
+    def test_watchdog_stops_hung_process(self):
+        import subprocess
+        import sys
+        import threading
+        from openjev import OpenJevCrossEncoder
+        encoder = OpenJevCrossEncoder.__new__(OpenJevCrossEncoder)
+        encoder.inference_timeout = 0.1
+        encoder._lock = threading.Lock()
+        encoder._process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            with self.assertRaises(TimeoutError):
+                encoder.request({"pairs": [["a", "b"]]})
+            self.assertFalse(encoder.is_alive())
+        finally:
+            encoder.close()
+
+    def test_busy_requests_fail_fast_and_health_stays_responsive(self):
+        import http.client
+        import json
+        import threading
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from openjev_server import make_handler
+        entered, release = threading.Event(), threading.Event()
+        store, hub = Mock(), Mock()
+        store.find_key.return_value = {"id": "test"}
+        hub.ready_ids.return_value = []
+        hub._loaded = {}
+        store.needs_setup.return_value = False
+        def infer(*args):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release inference")
+            return {"answers": {}, "usage": {}}
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(hub, store))
+        runner = threading.Thread(target=server.serve_forever)
+        runner.start()
+        def request(path, method="POST"):
+            conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+            try:
+                conn.request(method, path, body="{}" if method == "POST" else None)
+                res = conn.getresponse()
+                return res.status, json.loads(res.read())
+            finally:
+                conn.close()
+        first_result = []
+        first = threading.Thread(target=lambda: first_result.append(request("/v1/systemone")))
+        try:
+            with patch("openjev_server.handle_request", side_effect=infer):
+                first.start()
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(request("/v1/systemone")[0], 429)
+                self.assertEqual(request("/health", "GET")[0], 200)
+                release.set()
+                first.join(3)
+                self.assertEqual(first_result[0][0], 200)
+                self.assertEqual(request("/v1/systemone")[0], 200)
+        finally:
+            release.set()
+            first.join(3)
+            server.shutdown()
+            server.server_close()
+            runner.join()
+
 
 class AdminStoreTests(unittest.TestCase):
     def setUp(self):
