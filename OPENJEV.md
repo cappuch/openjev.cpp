@@ -62,10 +62,10 @@ with OpenJevCrossEncoder("models/openjev-4b-Q4_K_M.gguf") as jev:
 ## HTTP (SystemOne)
 
 ```sh
-.venv/bin/python openjev_server.py --api-key secret --port 8080
+.venv/bin/python openjev_server.py --port 8080
 ```
 
-Open `http://127.0.0.1:8080/` for settings. Launch does not download weights. Install a catalog id from that page (Bearer key required). Install runs in the background; the table polls `/v1/settings`. Prefer an existing `Q4_K_M` file, otherwise F16. Models load on the first `/v1/systemone` request that names them.
+Open `http://127.0.0.1:8080/`. First visit creates the admin username and password (PBKDF2-HMAC-SHA256, random salt; the password itself is not stored). After login you install models, mint Bearer API keys, and see request counts plus 60s throughput. Keys are stored as SHA-256 hashes and shown once. `--api-key` is optional and only seeds a hashed `cli` key. Launch does not download weights. Prefer an existing `Q4_K_M` file, otherwise F16. Models load on the first `/v1/systemone` request that names them.
 
 Kev checkpoints are LoRA adapters plus a pointer head on a Qwen base (`jaredpalmer/kev-*`). Install merges the adapter, converts the backbone, and writes a `*.head.bin` sidecar. The engine scores options with that pointer (state prefix + per-question branches), not 3-way NLI.
 
@@ -73,7 +73,7 @@ IDs: `jev-latest` (openjev 4B), `kev-latest` (kev 4B), `openjev_0.8b`, `openjev_
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/systemone \
-  -H 'Authorization: Bearer secret' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer oj_...' -H 'Content-Type: application/json' \
   -d '{"state":"The door is red.","model":"openjev_0.8b","questions":{"colour":{"type":"choice","instructions":"What colour is the door?","criteria":{"red":"red","blue":"blue"}}}}'
 ```
 
