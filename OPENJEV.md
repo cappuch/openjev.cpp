@@ -65,9 +65,11 @@ with OpenJevCrossEncoder("models/openjev-4b-Q4_K_M.gguf") as jev:
 .venv/bin/python openjev_server.py --api-key secret --port 8080
 ```
 
-On first start the server downloads Hugging Face weights and converts GGUF for `openjev_0.8b` and `openjev_4b` if they are missing. It prefers an existing `Q4_K_M` file, otherwise F16. The 35B-A3B checkpoint is opt-in (`--install-35b`). `--no-install` skips that. Models load on the first request that names them.
+Open `http://127.0.0.1:8080/` for settings. Launch does not download weights. Install a catalog id from that page (Bearer key required). Install runs in the background; the table polls `/v1/settings`. Prefer an existing `Q4_K_M` file, otherwise F16. Models load on the first `/v1/systemone` request that names them.
 
-IDs: `jev-latest` (4B), `openjev_0.8b`, `openjev_4b`, `openjev_35b`. `GET /v1/models` lists them. `GET /health` reports which GGUFs are on disk and which processes are loaded.
+Kev checkpoints are LoRA adapters plus a pointer head on a Qwen base (`jaredpalmer/kev-*`). Install merges the adapter, converts the backbone, and writes a `*.head.bin` sidecar. The engine scores options with that pointer (state prefix + per-question branches), not 3-way NLI.
+
+IDs: `jev-latest` (openjev 4B), `kev-latest` (kev 4B), `openjev_0.8b`, `openjev_4b`, `openjev_35b`, `kev_0.5b`, `kev_0.8b`, `kev_4b`, `kev_9b`. `GET /v1/models` lists them. `GET /health` reports which GGUFs are on disk and which processes are loaded.
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/systemone \
@@ -77,11 +79,11 @@ curl -sS http://127.0.0.1:8080/v1/systemone \
 
 `POST /v1/systemone` accepts `state`, `model`, and `questions` keyed by caller IDs. Those keys are echoed in `answers` and are not sent to the model. Question types:
 
-- `noul`: truth score in `[0, 1]`. Optional `criteria.true` / `criteria.false` are two hypotheses; otherwise the instructions are scored against the state.
-- `choice`: up to 255 options. Softmax over entailment logits; `choice` is the argmax, first option on a tie. Null criteria are skipped.
+- `noul`: truth score in `[0, 1]`. On openjev, optional `criteria.true` / `criteria.false` are two hypotheses; otherwise the instructions are scored against the state. On kev, options are `no`/`yes` (with those criteria texts when present) and `noul` is p(yes).
+- `choice`: up to 255 options. Openjev softmaxes entailment logits with the rerank wrapper `The correct answer is: `. Kev softmaxes pointer logits over `name` / `name: desc`. `choice` is the argmax, first option on a tie. Null criteria are skipped.
 - `score`: 2-10 ordered levels. `score` is the expected level index; `legend` keeps the original level text.
 
-Choice questions reuse the CLI rerank wrapper (`The correct answer is: `). `usage.input_tokens` is evaluated tokens; `usage.output_tokens` is 0. `GET /health` has no auth.
+`usage.input_tokens` is evaluated tokens; `usage.output_tokens` is 0. `GET /health` has no auth.
 
 
 For latents, open an encoder with `latents=True` and call `latents(pairs)` or `latents_hypotheses(premise, hypotheses)`. These are the unnormalized final-token hidden states before the classifier head. Classification and latent output use separate contexts.
