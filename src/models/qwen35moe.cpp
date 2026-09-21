@@ -44,10 +44,11 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+    cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_cls_out }, classifier_labels.empty() ? TENSOR_NOT_REQUIRED : 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    if (output == NULL && cls_out == nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -238,6 +239,14 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    if (model.cls_out) {
+        if (!cparams.embeddings) {
+            throw std::runtime_error("openjev classification requires embeddings mode");
+        }
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);

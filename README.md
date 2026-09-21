@@ -1,4 +1,14 @@
-# llama.cpp
+# openjev.cpp
+
+MIT-licensed llama.cpp fork for [openjev](https://huggingface.co/AlexWortega/openjev), the Qwen3.5 NLI cross-encoder. Native three-class scoring, reranking, grading, final-token latents, image inputs, and bounded shared-prefix reuse.
+
+**[Build and use openjev.cpp](OPENJEV.md)** | [Python client](openjev.py) | [Native CLI](tools/openjev/openjev.cpp)
+
+The original llama.cpp documentation follows. Upstream history and license are preserved; the upstream remote is `upstream`.
+
+---
+
+# llama.cpp (upstream)
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
