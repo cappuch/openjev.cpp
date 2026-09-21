@@ -12,6 +12,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.cookies import SimpleCookie
@@ -25,9 +26,17 @@ ROOT = Path(__file__).resolve().parent
 HF_REPO = "AlexWortega/openjev"
 LATEST_ID = "jev-latest"
 KEV_LATEST = "kev-latest"
-MAX_BODY = 2 * 1024 * 1024
+MAX_BODY = 16 * 1024 * 1024
 MAX_CHOICE = 255
 MAX_ENTRY_DEPTH = 32
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+IMAGE_SUFFIX = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/png": ".png",
+}
 
 CATALOG = {
     "openjev_0.8b": {
@@ -344,8 +353,10 @@ def flatten(entry, depth=0):
         raise RequestError("entry nesting is too deep")
     if isinstance(entry, str):
         return entry.strip()
-    if isinstance(entry, bool) or entry is None:
-        raise RequestError("entry values must be strings, arrays, or objects")
+    if entry is None:
+        return ""
+    if isinstance(entry, bool):
+        return "true" if entry else "false"
     if isinstance(entry, (int, float)):
         return str(entry)
     if isinstance(entry, list):
@@ -360,6 +371,124 @@ def flatten(entry, depth=0):
             parts.append(f"{key}: {text}" if text else str(key))
         return "\n".join(parts)
     raise RequestError("entry values must be strings, arrays, or objects")
+
+
+def _mime_suffix(mime):
+    return IMAGE_SUFFIX.get((mime or "").split(";")[0].strip().lower(), ".png")
+
+
+def _write_image(directory, blob, suffix):
+    if not blob:
+        raise RequestError("image payload is empty")
+    if len(blob) > MAX_IMAGE_BYTES:
+        raise RequestError("image is too large")
+    path = Path(directory) / f"input{suffix}"
+    path.write_bytes(blob)
+    return str(path)
+
+
+def _decode_data_url(text):
+    if not isinstance(text, str) or not text.startswith("data:image/"):
+        return None
+    header, _, blob = text.partition(",")
+    if not blob:
+        raise RequestError("image data URL is missing data")
+    mime = header[5:].split(";")[0]
+    try:
+        return base64.b64decode(blob, validate=False), _mime_suffix(mime)
+    except Exception as exc:
+        raise RequestError("image data URL is not valid base64") from exc
+
+
+IMAGE_OBJECT_KEYS = {
+    "type", "data", "media_type", "mime", "url", "image", "image_url", "source",
+}
+
+
+def _image_from_mapping(value, directory):
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("source") if isinstance(value.get("source"), dict) else value
+    if isinstance(value.get("image_url"), dict):
+        nested = {**nested, **value["image_url"]}
+    mime = nested.get("media_type") or nested.get("mime") or value.get("media_type") or value.get("mime")
+    typed = value.get("type") in {"image", "image_url"} or (
+        isinstance(mime, str) and mime.startswith("image/")
+    )
+    if not typed and (set(value.keys()) - IMAGE_OBJECT_KEYS):
+        return None
+    if not typed and "data" not in nested and "image" not in value and "url" not in nested:
+        return None
+    for candidate in (
+        nested.get("url"),
+        nested.get("data"),
+        value.get("data"),
+        value.get("url"),
+        value.get("image"),
+        nested.get("image"),
+    ):
+        if candidate is None or isinstance(candidate, dict):
+            continue
+        path = materialize_image(candidate, directory)
+        if path:
+            return path
+        if isinstance(candidate, str) and not candidate.startswith("data:") and not Path(candidate).is_file():
+            try:
+                blob = base64.b64decode(candidate, validate=False)
+            except Exception:
+                blob = b""
+            if blob:
+                return _write_image(directory, blob, _mime_suffix(mime if isinstance(mime, str) else "image/png"))
+    if typed:
+        raise RequestError("image object is missing data or a file path")
+    return None
+    if typed:
+        raise RequestError("image object is missing data or a file path")
+    return None
+
+
+def materialize_image(value, directory):
+    if value is None:
+        return None
+    decoded = _decode_data_url(value) if isinstance(value, str) else None
+    if decoded:
+        return _write_image(directory, decoded[0], decoded[1])
+    if isinstance(value, str):
+        path = Path(value)
+        if path.is_file():
+            return str(path.resolve())
+        if value.startswith("data:"):
+            raise RequestError("only data:image/... URLs are supported")
+        return None
+    if isinstance(value, dict):
+        return _image_from_mapping(value, directory)
+    return None
+
+
+def peel_images(entry, directory, found):
+    path = materialize_image(entry, directory)
+    if path:
+        if found:
+            raise RequestError("only one image is supported per request")
+        found.append(path)
+        return None
+    if isinstance(entry, list):
+        return [peel_images(item, directory, found) for item in entry]
+    if isinstance(entry, dict):
+        out = {}
+        for key, value in entry.items():
+            peeled = peel_images(value, directory, found)
+            if peeled is not None:
+                out[key] = peeled
+        return out
+    return entry
+
+
+def attach_image(payload, image):
+    if image:
+        payload = dict(payload)
+        payload["image"] = image
+    return payload
 
 
 def premise(state, instructions):
@@ -391,25 +520,25 @@ def confidence(probabilities):
     return max(probabilities.values()) if probabilities else 0.0
 
 
-def evaluate_noul(jev, state, question):
+def evaluate_noul(jev, state, question, image=None):
     criteria = question.get("criteria") or {}
     if not isinstance(criteria, dict):
         raise RequestError("noul criteria must be an object")
     true_entry = criteria.get("true")
     false_entry = criteria.get("false")
     if true_entry is not None and false_entry is not None:
-        response = jev.request({
+        response = jev.request(attach_image({
             "premise": premise(state, question["instructions"]),
             "hypotheses": [flatten(true_entry), flatten(false_entry)],
-        })
+        }, image))
         true_p, _false_p = softmax(entailment_logits(response))
         return {"type": "noul", "noul": true_p}, response
     hypothesis = flatten(true_entry) if true_entry is not None else flatten(question["instructions"])
-    response = jev.request({"pairs": [[flatten(state), hypothesis]]})
+    response = jev.request(attach_image({"pairs": [[flatten(state), hypothesis]]}, image))
     return {"type": "noul", "noul": binary_truth(response["results"][0])}, response
 
 
-def evaluate_choice(jev, state, question):
+def evaluate_choice(jev, state, question, image=None):
     criteria = question.get("criteria")
     if not isinstance(criteria, dict) or not criteria:
         raise RequestError("choice criteria must be a non-empty object")
@@ -423,10 +552,10 @@ def evaluate_choice(jev, state, question):
         options.append(flatten(value))
     if not keys:
         raise RequestError("choice requires at least one non-null option")
-    response = jev.request({
+    response = jev.request(attach_image({
         "question": premise(state, question["instructions"]),
         "options": options,
-    })
+    }, image))
     probabilities = dict(zip(keys, softmax(entailment_logits(response))))
     choice = max(keys, key=lambda key: (probabilities[key], -keys.index(key)))
     return {
@@ -437,17 +566,17 @@ def evaluate_choice(jev, state, question):
     }, response
 
 
-def evaluate_score(jev, state, question):
+def evaluate_score(jev, state, question, image=None):
     criteria = question.get("criteria")
     if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
         raise RequestError("score criteria must be an array of 2 to 10 levels")
     levels = [flatten(item) for item in criteria]
     if any(not level for level in levels):
         raise RequestError("score levels must flatten to non-empty text")
-    response = jev.request({
+    response = jev.request(attach_image({
         "premise": premise(state, question["instructions"]),
         "hypotheses": levels,
-    })
+    }, image))
     weights = softmax(entailment_logits(response))
     keys = [str(i) for i in range(len(levels))]
     probabilities = dict(zip(keys, weights))
@@ -460,16 +589,16 @@ def evaluate_score(jev, state, question):
     }, response
 
 
-def evaluate_question(jev, state, question):
+def evaluate_question(jev, state, question, image=None):
     if not isinstance(question, dict) or "type" not in question or "instructions" not in question:
         raise RequestError("each question needs type and instructions")
     kind = question["type"]
     if kind == "noul":
-        return evaluate_noul(jev, state, question)
+        return evaluate_noul(jev, state, question, image=image)
     if kind == "choice":
-        return evaluate_choice(jev, state, question)
+        return evaluate_choice(jev, state, question, image=image)
     if kind == "score":
-        return evaluate_score(jev, state, question)
+        return evaluate_score(jev, state, question, image=image)
     raise RequestError(f"unsupported question type: {kind}")
 
 
@@ -609,28 +738,41 @@ def handle_request(get_encoder, payload):
     questions = payload.get("questions")
     if not isinstance(questions, dict) or not questions:
         raise RequestError("questions must be a non-empty object")
-    if CATALOG[cid]["family"] == "kev":
-        rec, meta = kev_payload(payload["state"], questions)
-        response = jev.request(rec)
-        rows = response.get("results") or []
-        if len(rows) != len(meta):
-            raise RequestError("kev returned the wrong number of questions", 500)
+    with tempfile.TemporaryDirectory(prefix="openjev-img-") as tmp:
+        found = []
+        state = peel_images(payload["state"], tmp, found)
+        if state is None:
+            state = ""
+        top_image = materialize_image(payload.get("image"), tmp)
+        if top_image:
+            if found:
+                raise RequestError("only one image is supported per request")
+            found.append(top_image)
+        image = found[0] if found else None
+        if CATALOG[cid]["family"] == "kev":
+            if image:
+                raise RequestError("kev does not score images; use an openjev model")
+            rec, meta = kev_payload(state, questions)
+            response = jev.request(rec)
+            rows = response.get("results") or []
+            if len(rows) != len(meta):
+                raise RequestError("kev returned the wrong number of questions", 500)
+            return {
+                "model": model,
+                "answers": kev_answers([row["probabilities"] for row in rows], meta),
+                "usage": {"input_tokens": int(response.get("evaluated_tokens") or 0), "output_tokens": 0},
+            }
+        answers = {}
+        input_tokens = 0
+        for qid, question in questions.items():
+            answer, response = evaluate_question(jev, state, question, image=image)
+            answers[str(qid)] = answer
+            input_tokens += int(response.get("evaluated_tokens") or 0)
         return {
             "model": model,
-            "answers": kev_answers([row["probabilities"] for row in rows], meta),
-            "usage": {"input_tokens": int(response.get("evaluated_tokens") or 0), "output_tokens": 0},
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
         }
-    answers = {}
-    input_tokens = 0
-    for qid, question in questions.items():
-        answer, response = evaluate_question(jev, payload["state"], question)
-        answers[str(qid)] = answer
-        input_tokens += int(response.get("evaluated_tokens") or 0)
-    return {
-        "model": model,
-        "answers": answers,
-        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-    }
 
 
 def run(command, cwd=None):

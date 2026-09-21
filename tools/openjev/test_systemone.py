@@ -12,9 +12,10 @@ class FlattenTests(unittest.TestCase):
         self.assertIn("hp: 3", text)
         self.assertIn("wood", text)
 
-    def test_rejects_bool(self):
-        with self.assertRaises(RequestError):
-            flatten(True)
+    def test_bool_and_null(self):
+        self.assertEqual(flatten(True), "true")
+        self.assertEqual(flatten(False), "false")
+        self.assertEqual(flatten({"flag": False, "skip": None}), "flag: false")
 
 
 class HandleTests(unittest.TestCase):
@@ -146,6 +147,40 @@ class HandleTests(unittest.TestCase):
     def test_softmax(self):
         weights = softmax([0.0, 0.0])
         self.assertAlmostEqual(weights[0], 0.5)
+
+    def test_image_in_state_is_forwarded(self):
+        import base64
+        from pathlib import Path
+
+        seen = {}
+
+        def fake_request(payload):
+            seen["image"] = payload.get("image")
+            n = len(payload.get("options") or payload.get("hypotheses") or payload.get("pairs") or [0])
+            return {"results": [{"logits": [0.0, 1.0, 0.0]} for _ in range(n)], "evaluated_tokens": 3}
+
+        self.jev.request.side_effect = fake_request
+        out = handle_request(self.get_encoder, {
+            "state": {
+                "goal": "click Today",
+                "screenshot": {
+                    "type": "image",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode(),
+                },
+            },
+            "model": "openjev_0.8b",
+            "questions": {
+                "colour": {
+                    "type": "choice",
+                    "instructions": "What should we click?",
+                    "criteria": {"today": "Today", "none": "nothing"},
+                }
+            },
+        })
+        self.assertEqual(out["answers"]["colour"]["choice"], "today")
+        self.assertTrue(seen["image"])
+        self.assertTrue(Path(seen["image"]).name.startswith("input"))
 
     def test_catalog_has_no_auto_install_flag(self):
         from openjev_server import CATALOG
