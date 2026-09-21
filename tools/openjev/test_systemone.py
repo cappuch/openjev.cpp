@@ -153,5 +153,39 @@ class HandleTests(unittest.TestCase):
             self.assertNotIn("auto", spec)
 
 
+class AdminStoreTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from openjev_server import AdminStore
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = AdminStore(self.dir.name + "/admin.json")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_setup_login_and_keys(self):
+        token = self.store.setup("boss", "correct-horse")
+        self.assertEqual(self.store.session_user(token), "boss")
+        with self.assertRaises(Exception):
+            self.store.setup("boss", "correct-horse")
+        again = self.store.login("boss", "correct-horse")
+        self.assertEqual(self.store.session_user(again), "boss")
+        created = self.store.create_key("prod")
+        self.assertTrue(created["key"].startswith("oj_"))
+        found = self.store.find_key("Bearer " + created["key"])
+        self.assertEqual(found["id"], created["id"])
+        self.store.record(created["id"], 10, 0, 25.0)
+        snap = self.store.public_keys()
+        self.assertEqual(snap["totals"]["requests"], 1)
+        self.assertEqual(snap["keys"][0]["input_tokens"], 10)
+        self.assertGreater(snap["throughput"]["eval_tok_per_s"], 0)
+
+    def test_bad_password(self):
+        from openjev_server import RequestError
+        self.store.setup("boss", "correct-horse")
+        with self.assertRaises(RequestError):
+            self.store.login("boss", "wrong-wrong")
+
+
 if __name__ == "__main__":
     unittest.main()

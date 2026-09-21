@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import math
+import secrets
 import shutil
 import subprocess
 import sys
 import threading
+import time
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -95,6 +101,242 @@ class RequestError(ValueError):
     def __init__(self, message, status=400):
         super().__init__(message)
         self.status = status
+
+
+PBKDF2_ITERS = 200000
+SESSION_TTL = 86400
+SAMPLE_KEEP = 300
+ADMIN_FILE = ROOT / "openjev-admin.json"
+
+
+def _pbkdf2(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERS)
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    return salt, _pbkdf2(password, salt)
+
+
+def verify_password(password, salt, digest):
+    return hmac.compare_digest(_pbkdf2(password, salt), digest)
+
+
+class AdminStore:
+    def __init__(self, path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._data = {
+            "admin": None,
+            "secret": secrets.token_hex(32),
+            "keys": [],
+            "samples": [],
+            "totals": {"requests": 0, "input_tokens": 0, "output_tokens": 0, "elapsed_ms": 0.0},
+        }
+        self._load()
+
+    def _load(self):
+        if not self.path.is_file():
+            return
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            self._data.update(raw)
+            self._data.setdefault("keys", [])
+            self._data.setdefault("samples", [])
+            self._data.setdefault("totals", {"requests": 0, "input_tokens": 0, "output_tokens": 0, "elapsed_ms": 0.0})
+            self._data.setdefault("secret", secrets.token_hex(32))
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self._data), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def needs_setup(self):
+        return self._data.get("admin") is None
+
+    def setup(self, username, password):
+        username = (username or "").strip()
+        if not username or len(username) > 64 or any(ch in username for ch in " \t\r\n:"):
+            raise RequestError("username must be one token, 1 to 64 characters")
+        if not isinstance(password, str) or len(password) < 8:
+            raise RequestError("password must be at least 8 characters")
+        with self._lock:
+            if self._data.get("admin"):
+                raise RequestError("admin already exists", 409)
+            salt, digest = hash_password(password)
+            self._data["admin"] = {
+                "username": username,
+                "salt": salt.hex(),
+                "hash": digest.hex(),
+                "iters": PBKDF2_ITERS,
+            }
+            self._save()
+            return self._issue_session(username)
+
+    def login(self, username, password):
+        with self._lock:
+            admin = self._data.get("admin")
+            if not admin:
+                raise RequestError("admin is not set up", 409)
+            salt = bytes.fromhex(admin["salt"])
+            digest = bytes.fromhex(admin["hash"])
+            user_ok = hmac.compare_digest(admin["username"], (username or "").strip())
+            pass_ok = isinstance(password, str) and verify_password(password, salt, digest)
+            if not (user_ok and pass_ok):
+                raise RequestError("invalid username or password", 401)
+            return self._issue_session(admin["username"])
+
+    def _issue_session(self, username):
+        exp = int(time.time()) + SESSION_TTL
+        payload = f"{username}:{exp}".encode("utf-8")
+        sig = hmac.new(bytes.fromhex(self._data["secret"]), payload, hashlib.sha256).hexdigest()
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=") + "." + sig
+
+    def session_user(self, token):
+        if not token or "." not in token:
+            return None
+        blob, sig = token.rsplit(".", 1)
+        pad = "=" * ((4 - len(blob) % 4) % 4)
+        try:
+            payload = base64.urlsafe_b64decode(blob + pad)
+        except Exception:
+            return None
+        expect = hmac.new(bytes.fromhex(self._data["secret"]), payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expect, sig):
+            return None
+        try:
+            username, exp_s = payload.decode("utf-8").rsplit(":", 1)
+            exp = int(exp_s)
+        except ValueError:
+            return None
+        if exp < int(time.time()):
+            return None
+        admin = self._data.get("admin")
+        if not admin or not hmac.compare_digest(admin["username"], username):
+            return None
+        return username
+
+    def create_key(self, name=""):
+        name = (name or "").strip() or "key"
+        if len(name) > 64:
+            raise RequestError("key name is too long")
+        raw = "oj_" + secrets.token_urlsafe(24)
+        record = {
+            "id": "k_" + secrets.token_hex(8),
+            "name": name,
+            "prefix": raw[:10],
+            "hash": hashlib.sha256(raw.encode()).hexdigest(),
+            "created": int(time.time()),
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "elapsed_ms": 0.0,
+            "last_used": None,
+        }
+        with self._lock:
+            self._data["keys"].append(record)
+            self._save()
+        return {"id": record["id"], "name": name, "prefix": record["prefix"], "key": raw}
+
+    def add_known_key(self, raw, name="cli"):
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        with self._lock:
+            for key in self._data["keys"]:
+                if key["hash"] == digest:
+                    return
+            self._data["keys"].append({
+                "id": "k_" + secrets.token_hex(8),
+                "name": name,
+                "prefix": raw[:10],
+                "hash": digest,
+                "created": int(time.time()),
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "elapsed_ms": 0.0,
+                "last_used": None,
+            })
+            self._save()
+
+    def revoke_key(self, key_id):
+        with self._lock:
+            before = len(self._data["keys"])
+            self._data["keys"] = [key for key in self._data["keys"] if key["id"] != key_id]
+            if len(self._data["keys"]) == before:
+                raise RequestError("unknown key", 404)
+            self._save()
+
+    def find_key(self, bearer):
+        if not bearer or not bearer.startswith("Bearer "):
+            return None
+        raw = bearer[7:].strip()
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        with self._lock:
+            for key in self._data["keys"]:
+                if hmac.compare_digest(key["hash"], digest):
+                    return key
+        return None
+
+    def record(self, key_id, input_tokens, output_tokens, elapsed_ms):
+        now = time.time()
+        with self._lock:
+            self._data["totals"]["requests"] += 1
+            self._data["totals"]["input_tokens"] += int(input_tokens)
+            self._data["totals"]["output_tokens"] += int(output_tokens)
+            self._data["totals"]["elapsed_ms"] += float(elapsed_ms)
+            for key in self._data["keys"]:
+                if key["id"] == key_id:
+                    key["requests"] += 1
+                    key["input_tokens"] += int(input_tokens)
+                    key["output_tokens"] += int(output_tokens)
+                    key["elapsed_ms"] += float(elapsed_ms)
+                    key["last_used"] = int(now)
+                    break
+            samples = self._data["samples"]
+            samples.append([now, int(input_tokens), float(elapsed_ms), key_id])
+            if len(samples) > SAMPLE_KEEP:
+                del samples[: len(samples) - SAMPLE_KEEP]
+            self._save()
+
+    def _throughput(self, window=60.0):
+        now = time.time()
+        cutoff = now - window
+        tokens = 0
+        ms = 0.0
+        reqs = 0
+        for stamp, tok, elapsed, _key in self._data.get("samples") or []:
+            if stamp >= cutoff:
+                tokens += int(tok)
+                ms += float(elapsed)
+                reqs += 1
+        return {
+            "window_s": window,
+            "requests": reqs,
+            "req_per_s": reqs / window,
+            "input_tokens": tokens,
+            "tokens_per_s": tokens / window,
+            "eval_tok_per_s": (1000.0 * tokens / ms) if ms else 0.0,
+        }
+
+    def public_keys(self):
+        with self._lock:
+            keys = []
+            for key in self._data["keys"]:
+                keys.append({
+                    "id": key["id"],
+                    "name": key["name"],
+                    "prefix": key["prefix"],
+                    "created": key["created"],
+                    "requests": key["requests"],
+                    "input_tokens": key["input_tokens"],
+                    "output_tokens": key["output_tokens"],
+                    "last_used": key["last_used"],
+                    "eval_tok_per_s": (1000.0 * key["input_tokens"] / key["elapsed_ms"]) if key["elapsed_ms"] else 0.0,
+                })
+            totals = dict(self._data["totals"])
+            throughput = self._throughput()
+        return {"keys": keys, "totals": totals, "throughput": throughput}
 
 
 def flatten(entry, depth=0):
@@ -572,101 +814,180 @@ class ModelHub:
             self._loaded.clear()
 
 
-SETTINGS_PAGE = """<!doctype html>
+ADMIN_PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>openjev settings</title>
+<title>openjev admin</title>
 <style>
-body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; max-width: 920px; color: #111; }
+body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; max-width: 980px; color: #111; }
 h1 { font-size: 20px; margin: 0 0 8px; }
-p, td, th, label { font-size: 14px; }
+h2 { font-size: 16px; margin: 28px 0 8px; }
+p, td, th, label, button { font-size: 14px; }
 .muted { color: #555; }
-table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #ddd; vertical-align: top; }
-button { cursor: pointer; }
 .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
-input[type=password], input[type=text] { min-width: 220px; padding: 6px 8px; }
-.ok { color: #0a7; }
-.bad { color: #c00; }
-.run { color: #a60; }
+input { padding: 6px 8px; }
+button { cursor: pointer; }
+.ok { color: #0a7; } .bad { color: #c00; } .run { color: #a60; }
+.cards { display: flex; gap: 12px; flex-wrap: wrap; }
+.card { border: 1px solid #ddd; padding: 10px 12px; min-width: 140px; }
+.card b { display: block; font-size: 18px; }
+.hide { display: none; }
+code { word-break: break-all; }
 </style>
 </head>
 <body>
-<h1>openjev settings</h1>
-<p class="muted">Nothing downloads until you press Install. SystemOne stays at <code>POST /v1/systemone</code>.</p>
-<div class="row">
-<label>API key <input id="key" type="password" autocomplete="off"></label>
-<span id="note" class="muted"></span>
-</div>
-<table>
-<thead><tr><th>id</th><th>family</th><th>disk</th><th>loaded</th><th></th></tr></thead>
-<tbody id="rows"></tbody>
-</table>
+<h1>openjev admin</h1>
+<p class="muted" id="blurb"></p>
+<section id="gate" class="hide">
+  <form id="gate-form" class="row">
+    <label>username <input name="username" autocomplete="username" required></label>
+    <label>password <input name="password" type="password" autocomplete="new-password" required></label>
+    <button type="submit" id="gate-btn">continue</button>
+  </form>
+</section>
+<section id="dash" class="hide">
+  <div class="row"><span id="who"></span><button id="logout">log out</button></div>
+  <div class="cards" id="cards"></div>
+  <h2>API keys</h2>
+  <form id="key-form" class="row">
+    <label>name <input name="name" placeholder="prod"></label>
+    <button type="submit">create key</button>
+  </form>
+  <p id="newkey" class="ok"></p>
+  <table><thead><tr><th>name</th><th>prefix</th><th>requests</th><th>input tokens</th><th>eval tok/s</th><th></th></tr></thead><tbody id="keys"></tbody></table>
+  <h2>models</h2>
+  <p class="muted" id="note"></p>
+  <table><thead><tr><th>id</th><th>family</th><th>disk</th><th>loaded</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+</section>
 <script>
-const keyEl = document.getElementById('key');
-keyEl.value = localStorage.getItem('openjev-api-key') || '';
-keyEl.addEventListener('change', () => localStorage.setItem('openjev-api-key', keyEl.value));
+function $(id) { return document.getElementById(id); }
 function cls(state) {
   if (state === 'ready' || state === true) return 'ok';
   if (state === 'error' || state === false) return 'bad';
   if (state === 'running') return 'run';
   return '';
 }
+async function api(path, opt) {
+  const r = await fetch(path, Object.assign({ credentials: 'same-origin' }, opt || {}));
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function show(id) {
+  $('gate').classList.toggle('hide', id !== 'gate');
+  $('dash').classList.toggle('hide', id !== 'dash');
+}
+async function boot() {
+  const s = await api('/v1/admin/state');
+  if (s.setup) {
+    $('blurb').textContent = 'Create the admin username and password. Password is stored as PBKDF2-HMAC-SHA256 with a random salt.';
+    $('gate-btn').textContent = 'create admin';
+    $('gate-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      try {
+        await api('/v1/admin/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: f.get('username'), password: f.get('password') }) });
+        location.reload();
+      } catch (err) { alert(err.message); }
+    };
+    show('gate');
+    return;
+  }
+  if (!s.auth) {
+    $('blurb').textContent = 'Log in to install models, mint API keys, and read usage.';
+    $('gate-btn').textContent = 'log in';
+    $('gate-form').querySelector('[name=password]').autocomplete = 'current-password';
+    $('gate-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      try {
+        await api('/v1/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: f.get('username'), password: f.get('password') }) });
+        location.reload();
+      } catch (err) { alert(err.message); }
+    };
+    show('gate');
+    return;
+  }
+  $('blurb').textContent = 'Bearer API keys call POST /v1/systemone. Install does not run until you click it.';
+  $('who').textContent = 'signed in as ' + s.username;
+  $('logout').onclick = async () => { await api('/v1/admin/logout', { method: 'POST' }); location.reload(); };
+  $('key-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    try {
+      const created = await api('/v1/admin/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: f.get('name') }) });
+      $('newkey').textContent = 'copy now (shown once): ' + created.key;
+      refresh();
+    } catch (err) { alert(err.message); }
+  };
+  show('dash');
+  refresh();
+  setInterval(refresh, 2000);
+}
 async function refresh() {
-  const r = await fetch('/v1/settings');
-  const data = await r.json();
-  document.getElementById('note').textContent = 'ready: ' + (data.ready.join(', ') || 'none');
-  const body = document.getElementById('rows');
-  body.innerHTML = '';
-  for (const m of data.models) {
+  const [admin, models] = await Promise.all([api('/v1/admin/dashboard'), api('/v1/settings')]);
+  const t = admin.throughput || {};
+  const tot = admin.totals || {};
+  $('cards').innerHTML =
+    card('requests', tot.requests) + card('input tokens', tot.input_tokens) +
+    card('req/s (60s)', (t.req_per_s || 0).toFixed(2)) +
+    card('tok/s wall (60s)', (t.tokens_per_s || 0).toFixed(1)) +
+    card('eval tok/s (60s)', (t.eval_tok_per_s || 0).toFixed(1));
+  const keys = $('keys'); keys.innerHTML = '';
+  for (const k of admin.keys) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + k.name + '</td><td><code>' + k.prefix + '...</code></td><td>' + k.requests +
+      '</td><td>' + k.input_tokens + '</td><td>' + (k.eval_tok_per_s || 0).toFixed(1) + '</td>';
+    const td = document.createElement('td');
+    const b = document.createElement('button');
+    b.textContent = 'revoke';
+    b.onclick = async () => { await api('/v1/admin/keys/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: k.id }) }); refresh(); };
+    td.appendChild(b); tr.appendChild(td); keys.appendChild(tr);
+  }
+  $('note').textContent = 'ready: ' + ((models.ready || []).join(', ') || 'none');
+  const body = $('rows'); body.innerHTML = '';
+  for (const m of models.models) {
     const tr = document.createElement('tr');
     const job = m.job ? m.job.state + (m.job.error ? ' ' + m.job.error : '') : '';
     const disk = m.ready ? (m.file || 'yes') : (job || 'missing');
-    tr.innerHTML = '<td><code>' + m.id + '</code><div class="muted">' + m.source + '</div></td>' +
-      '<td>' + m.family + '</td>' +
-      '<td class="' + cls(m.ready ? 'ready' : (m.job && m.job.state)) + '">' + disk + '</td>' +
-      '<td class="' + cls(m.loaded) + '">' + (m.loaded ? 'yes' : 'no') + '</td>';
+    tr.innerHTML = '<td><code>' + m.id + '</code><div class="muted">' + m.source + '</div></td><td>' + m.family +
+      '</td><td class="' + cls(m.ready ? 'ready' : (m.job && m.job.state)) + '">' + disk +
+      '</td><td class="' + cls(m.loaded) + '">' + (m.loaded ? 'yes' : 'no') + '</td>';
     const td = document.createElement('td');
     const b = document.createElement('button');
     b.textContent = m.ready ? 'installed' : (m.job && m.job.state === 'running' ? 'installing...' : 'install');
     b.disabled = !!(m.ready || (m.job && m.job.state === 'running'));
     b.onclick = () => install(m.id);
-    td.appendChild(b);
-    tr.appendChild(td);
-    body.appendChild(tr);
+    td.appendChild(b); tr.appendChild(td); body.appendChild(tr);
   }
 }
+function card(label, value) { return '<div class="card"><b>' + value + '</b><span class="muted">' + label + '</span></div>'; }
 async function install(id) {
-  const key = keyEl.value;
-  if (!key) { alert('set the API key first'); return; }
-  localStorage.setItem('openjev-api-key', key);
-  const r = await fetch('/v1/settings/install', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: id }),
-  });
-  const data = await r.json();
-  if (!r.ok) { alert(data.error || r.statusText); return; }
-  refresh();
+  try { await api('/v1/settings/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) }); refresh(); }
+  catch (err) { alert(err.message); }
 }
-refresh();
-setInterval(refresh, 2000);
+boot();
 </script>
 </body>
 </html>
 """
 
 
-def make_handler(hub, api_key):
+def make_handler(hub, store):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, format, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
-        def _send(self, status, payload, content_type="application/json; charset=utf-8"):
+        def _send(self, status, payload, content_type="application/json; charset=utf-8", cookie=None, clear_cookie=False):
             if isinstance(payload, str):
                 body = payload.encode("utf-8")
             else:
@@ -675,11 +996,23 @@ def make_handler(hub, api_key):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
+            if cookie:
+                self.send_header("Set-Cookie", "openjev_session=" + cookie + "; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400")
+            if clear_cookie:
+                self.send_header("Set-Cookie", "openjev_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
             self.end_headers()
             self.wfile.write(body)
 
-        def _auth_ok(self):
-            return self.headers.get("Authorization", "") == "Bearer " + api_key
+        def _session(self):
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            morsel = jar.get("openjev_session")
+            return store.session_user(morsel.value if morsel else "")
+
+        def _require_admin(self):
+            user = self._session()
+            if not user:
+                raise RequestError("unauthorized", 401)
+            return user
 
         def _read_json(self):
             length = self.headers.get("Content-Length")
@@ -697,13 +1030,32 @@ def make_handler(hub, api_key):
         def do_GET(self):
             path = urlparse(self.path).path
             if path in ("/", "/settings"):
-                self._send(200, SETTINGS_PAGE, "text/html; charset=utf-8")
+                self._send(200, ADMIN_PAGE, "text/html; charset=utf-8")
                 return
             if path == "/health":
-                self._send(200, {"ok": True, "models": hub.ready_ids(), "loaded": sorted(hub._loaded)})
+                self._send(200, {"ok": True, "models": hub.ready_ids(), "loaded": sorted(hub._loaded),
+                                 "setup": store.needs_setup()})
+                return
+            if path == "/v1/admin/state":
+                if store.needs_setup():
+                    self._send(200, {"setup": True, "auth": False})
+                    return
+                user = self._session()
+                self._send(200, {"setup": False, "auth": bool(user), "username": user})
+                return
+            if path == "/v1/admin/dashboard":
+                try:
+                    self._require_admin()
+                    self._send(200, store.public_keys())
+                except RequestError as exc:
+                    self._send(exc.status, {"error": str(exc)})
                 return
             if path == "/v1/settings":
-                self._send(200, hub.status())
+                try:
+                    self._require_admin()
+                    self._send(200, hub.status())
+                except RequestError as exc:
+                    self._send(exc.status, {"error": str(exc)})
                 return
             if path == "/v1/models":
                 self._send(200, {"data": [{"id": name, "owned_by": "openjev"} for name in known_model_ids()]})
@@ -712,28 +1064,53 @@ def make_handler(hub, api_key):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path == "/v1/settings/install":
-                if not self._auth_ok():
-                    self._send(401, {"error": "unauthorized"})
+            try:
+                if path == "/v1/admin/setup":
+                    payload = self._read_json()
+                    token = store.setup(payload.get("username"), payload.get("password"))
+                    self._send(200, {"ok": True}, cookie=token)
                     return
-                try:
+                if path == "/v1/admin/login":
+                    payload = self._read_json()
+                    token = store.login(payload.get("username"), payload.get("password"))
+                    self._send(200, {"ok": True}, cookie=token)
+                    return
+                if path == "/v1/admin/logout":
+                    self._send(200, {"ok": True}, clear_cookie=True)
+                    return
+                if path == "/v1/admin/keys":
+                    self._require_admin()
+                    payload = self._read_json()
+                    if not isinstance(payload, dict):
+                        raise RequestError("request must be an object")
+                    self._send(200, store.create_key(payload.get("name")))
+                    return
+                if path == "/v1/admin/keys/revoke":
+                    self._require_admin()
+                    payload = self._read_json()
+                    store.revoke_key((payload or {}).get("id"))
+                    self._send(200, {"ok": True})
+                    return
+                if path == "/v1/settings/install":
+                    self._require_admin()
                     payload = self._read_json()
                     if not isinstance(payload, dict):
                         raise RequestError("request must be an object")
                     self._send(200, hub.start_install(payload.get("model")))
-                except RequestError as exc:
-                    self._send(exc.status, {"error": str(exc)})
-                except Exception as exc:
-                    self._send(500, {"error": str(exc)})
-                return
-            if path != "/v1/systemone":
-                self._send(404, {"error": "not found"})
-                return
-            if not self._auth_ok():
-                self._send(401, {"error": "unauthorized"})
-                return
-            try:
-                self._send(200, handle_request(hub.encoder, self._read_json()))
+                    return
+                if path != "/v1/systemone":
+                    self._send(404, {"error": "not found"})
+                    return
+                key = store.find_key(self.headers.get("Authorization", ""))
+                if not key:
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                started = time.time()
+                result = handle_request(hub.encoder, self._read_json())
+                usage = result.get("usage") or {}
+                store.record(key["id"], usage.get("input_tokens") or 0, usage.get("output_tokens") or 0,
+                             (time.time() - started) * 1000.0)
+                self._send(200, result)
             except RequestError as exc:
                 self._send(exc.status, {"error": str(exc)})
             except ValueError as exc:
@@ -747,19 +1124,25 @@ def make_handler(hub, api_key):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary")
-    parser.add_argument("--api-key", required=True)
+    parser.add_argument("--api-key", help="optional seed API key stored as a hash (named cli in the panel)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--gpu-layers", type=int, default=99)
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--admin-file", default=str(ADMIN_FILE))
     args = parser.parse_args()
     binary = args.binary or str(ROOT / "build" / "bin" / "openjev")
+    store = AdminStore(args.admin_file)
+    if args.api_key:
+        store.add_known_key(args.api_key, "cli")
     hub = ModelHub(ROOT, binary=binary, gpu_layers=args.gpu_layers, threads=args.threads,
                    quantize_bin=str(ROOT / "build" / "bin" / "llama-quantize"))
     try:
-        server = ThreadingHTTPServer((args.host, args.port), make_handler(hub, args.api_key))
-        print(f"openjev settings http://{args.host}:{args.port}/", flush=True)
+        server = ThreadingHTTPServer((args.host, args.port), make_handler(hub, store))
+        print(f"openjev admin http://{args.host}:{args.port}/", flush=True)
         print(f"openjev systemone http://{args.host}:{args.port}/v1/systemone", flush=True)
+        if store.needs_setup():
+            print("openjev: create the admin account in the browser", flush=True)
         print("models: " + ", ".join(hub.ready_ids() or ["none"]), flush=True)
         try:
             server.serve_forever()
