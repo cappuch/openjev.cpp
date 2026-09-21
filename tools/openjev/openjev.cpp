@@ -278,10 +278,13 @@ class cross_encoder {
         if (n_chunks == 0) { throw std::runtime_error("image tokenization produced no chunks"); }
         const bool split = n_chunks > 1 &&
             mtmd_input_chunk_get_type(mtmd_input_chunks_get(first.get(), n_chunks - 1)) == MTMD_INPUT_CHUNK_TYPE_TEXT;
+        if (!split) {
+            throw std::runtime_error("image request must tokenize as prefix chunks plus a text hypothesis");
+        }
         auto memory = llama_get_memory(ctx.get());
         llama_memory_clear(memory, false);
         llama_pos prefix_past = 0;
-        const size_t prefix_n = split ? n_chunks - 1 : 0;
+        const size_t prefix_n = n_chunks - 1;
         for (size_t i = 0; i < prefix_n; ++i) {
             if (mtmd_helper_eval_chunk_single(vision.get(), ctx.get(), mtmd_input_chunks_get(first.get(), i),
                                               prefix_past, 0, opt.batch, false, &prefix_past) != 0) {
@@ -289,7 +292,7 @@ class cross_encoder {
             }
         }
         json rows = json::array();
-        const llama_seq_id branch = split ? 1 : 0;
+        const llama_seq_id branch = 1;
         for (size_t p = 0; p < pairs.size(); ++p) {
             std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> extra{nullptr, mtmd_input_chunks_free};
             const mtmd_input_chunks * chunks = first.get();
@@ -297,30 +300,11 @@ class cross_encoder {
                 extra = tokenize_image_pair(pairs[p].first, pairs[p].second, ptr);
                 chunks = extra.get();
             }
-            if (mtmd_input_chunks_size(chunks) != n_chunks || !split) {
-                llama_memory_clear(memory, false);
-                llama_pos past = 0;
-                if (mtmd_helper_eval_chunks(vision.get(), ctx.get(), chunks, 0, 0, opt.batch, true, &past) != 0) {
-                    throw std::runtime_error("image evaluation failed");
-                }
-                evaluated_tokens += mtmd_helper_get_n_tokens(chunks);
-                rows.push_back(result(0));
-                if (split && p + 1 < pairs.size()) {
-                    llama_memory_clear(memory, false);
-                    prefix_past = 0;
-                    for (size_t i = 0; i < prefix_n; ++i) {
-                        if (mtmd_helper_eval_chunk_single(vision.get(), ctx.get(), mtmd_input_chunks_get(first.get(), i),
-                                                          prefix_past, 0, opt.batch, false, &prefix_past) != 0) {
-                            throw std::runtime_error("image evaluation failed");
-                        }
-                    }
-                }
-                continue;
+            if (mtmd_input_chunks_size(chunks) != n_chunks) {
+                throw std::runtime_error("image pair chunk layout changed across hypotheses");
             }
-            if (split) {
-                if (!llama_memory_seq_rm(memory, branch, -1, -1)) { throw std::runtime_error("cannot reset branch"); }
-                llama_memory_seq_cp(memory, 0, branch, -1, -1);
-            }
+            if (!llama_memory_seq_rm(memory, branch, -1, -1)) { throw std::runtime_error("cannot reset branch"); }
+            llama_memory_seq_cp(memory, 0, branch, -1, -1);
             llama_pos past = prefix_past;
             if (mtmd_helper_eval_chunk_single(vision.get(), ctx.get(), mtmd_input_chunks_get(chunks, n_chunks - 1),
                                               past, branch, opt.batch, true, &past) != 0) {
