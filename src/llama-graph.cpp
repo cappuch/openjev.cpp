@@ -297,7 +297,8 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 
         const bool last = (
              cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ||
-            (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL)) // qwen3 reranking & embedding models use last token
+            (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK &&
+                (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE))
         );
 
         for (int i = 0; i < n_tokens; ++i) {

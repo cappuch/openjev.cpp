@@ -646,6 +646,54 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
+class _OpenJevClassifierMixin:
+    supports_mtp_export = False
+
+    def __init__(self, *args, **kwargs):
+        # Sequence classifiers retain the backbone config but have no MTP layers.
+        type(self).no_mtp = True
+        super().__init__(*args, **kwargs)
+        self.openjev_config = ModelBase.load_hparams(self.dir_model, False)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        labels = {str(k): v for k, v in self.openjev_config.get("id2label", {}).items()}
+        if labels != {"0": "contradiction", "1": "entailment", "2": "neutral"}:
+            raise ValueError("openjev requires labels [contradiction, entailment, neutral]")
+        template = self.openjev_config.get("nli_template", "Premise: {premise}\nHypothesis: {hypothesis}")
+        if template != "Premise: {premise}\nHypothesis: {hypothesis}":
+            raise ValueError(f"Unsupported openjev NLI template: {template!r}")
+        self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
+        self.gguf_writer.add_classifier_output_labels([labels[str(i)] for i in range(3)])
+        self.gguf_writer.add_causal_attention(True)
+        self.gguf_writer.add_string("openjev.nli_template", template)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
+        if name == "score.weight":
+            if tuple(data_torch.shape) != (3, self.hparams["hidden_size"]):
+                raise ValueError(f"Invalid openjev score shape: {tuple(data_torch.shape)}")
+            yield "cls.output.weight", data_torch.float()
+            return
+        if name.startswith("score."):
+            raise ValueError(f"Unsupported openjev classifier tensor: {name}")
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if new_name == "cls.output.weight":
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+
+@ModelBase.register("Qwen3_5ForSequenceClassification")
+class OpenJevModel(_OpenJevClassifierMixin, Qwen3_5TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+
+@ModelBase.register("Qwen3_5MoeForSequenceClassification")
+class OpenJevMoeModel(_OpenJevClassifierMixin, Qwen3_5MoeTextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35MOE
+
+
 @ModelBase.register("DFlashDraftModel", "DFlash2DraftModel")
 @ModelBase.example("z-lab/Qwen3.5-9B-DFlash")
 class DFlashModel(Qwen3Model):

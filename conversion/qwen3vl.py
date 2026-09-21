@@ -13,7 +13,7 @@ from .qwen import Qwen3Model, Qwen3MoeModel
 from .qwenvl import Qwen25AudioModel
 
 
-@ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration")
+@ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForSequenceClassification", "Qwen3_5MoeForSequenceClassification")
 @ModelBase.example("Qwen/Qwen3-VL-4B-Instruct", "Qwen/Qwen3-VL-30B-A3B-Instruct", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-35B-A3B")
 class Qwen3VLVisionModel(MmprojModel):
     def __init__(self, *args, **kwargs):
@@ -41,6 +41,9 @@ class Qwen3VLVisionModel(MmprojModel):
             self.is_deepstack_layers[idx] = True
 
     def set_gguf_parameters(self):
+        pre = self.preprocessor_config
+        pre.setdefault("image_mean", [0.5, 0.5, 0.5])
+        pre.setdefault("image_std", [0.5, 0.5, 0.5])
         super().set_gguf_parameters()
         # in case mixed modalities, the arch will be handled by subclass
         if not self.has_audio_encoder:
@@ -51,6 +54,12 @@ class Qwen3VLVisionModel(MmprojModel):
             merge_size = self.hparams_vision.get("spatial_merge_size")
             if merge_size is not None:
                 self.gguf_writer.add_vision_spatial_merge_size(int(merge_size))
+            size = pre.get("size")
+            size = size if isinstance(size, dict) else {}
+            min_pixels = pre.get("min_pixels", size.get("shortest_edge", 65536))
+            max_pixels = pre.get("max_pixels", size.get("longest_edge", 16777216))
+            self.gguf_writer.add_vision_min_pixels(int(min_pixels))
+            self.gguf_writer.add_vision_max_pixels(int(max_pixels))
 
         # Use text config's rms_norm_eps for vision attention layernorm eps
         rms_norm_eps = self.global_config.get("text_config", {}).get("rms_norm_eps", 1e-6)
