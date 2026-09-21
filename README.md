@@ -2,9 +2,29 @@
 
 MIT-licensed llama.cpp fork for [openjev](https://huggingface.co/AlexWortega/openjev), the Qwen3.5 NLI cross-encoder. Native three-class scoring, reranking, grading, final-token latents, image inputs, and bounded shared-prefix reuse.
 
-**[Build and use openjev.cpp](OPENJEV.md)** | [Python client](openjev.py) | [Native CLI](tools/openjev/openjev.cpp)
+**[Build and use openjev.cpp](OPENJEV.md)** | [Python client](openjev.py) | [Native CLI](tools/openjev/openjev.cpp) | [SystemOne HTTP](openjev_server.py)
 
-The original llama.cpp documentation follows. Upstream history and license are preserved; the upstream remote is `upstream`.
+## Why openjev.cpp
+
+llama.cpp is a text generator. openjev is a classifier: last-token pooling, a 3-way `score` head, no chat template, no vocab projection. The GGUF does not carry an `lm_head`, so stock `llama-cli` / `llama-bench` cannot decode it unless you force embeddings mode.
+
+On a single prompt the backbone is the same speed as llama.cpp. Against `llama-bench -embd 1` on upstream commit `6f41ac59e0a49a00483a316a22ada6b04edd2950` (Metal, Apple M5, F16, ubatch 512):
+
+- 4B: 339 tok/s vs 336 tok/s
+- 0.8B: about 1.6-1.8k tok/s either way
+
+The win is the NLI request shape. Scoring several hypotheses that share a premise re-prefills each pair in llama.cpp embeddings. openjev prefills the common token prefix once, copies KV and recurrent state, and packs remaining suffixes into one decode (up to four pairs plus the prefix). Device context stays `2 * --ctx-size`.
+
+Measured wall time for four long hypotheses (932 independent tokens, 248 with prefix cache):
+
+| Model | llama.cpp-style independent | openjev prefix cache | vs llama.cpp |
+| --- | ---: | ---: | ---: |
+| 4B F16 | 2.8 s | 1.3 s | about 2.2x |
+| 0.8B F16 | 0.52 s | 0.13-0.22 s | about 2-4x |
+
+Three short hypotheses on 0.8B F16 dropped from 387 ms (one decode per suffix) to about 140 ms once suffixes share a graph. A 20-token pair is still ~20-60 ms on 0.8B and ~300 ms on 4B; short prompts are launch-bound on both stacks. Images skip prefix cache and run each pair independently through mtmd.
+
+`--no-prefix-cache` is the independent-pair baseline. Numbers above exclude model load; the Python client keeps the process alive.
 
 ---
 
