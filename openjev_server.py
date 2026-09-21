@@ -15,6 +15,8 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -548,25 +550,22 @@ def confidence(probabilities):
     return max(probabilities.values()) if probabilities else 0.0
 
 
-def evaluate_noul(jev, state, question, image=None):
+def prepare_noul(state, question):
     criteria = question.get("criteria") or {}
     if not isinstance(criteria, dict):
         raise RequestError("noul criteria must be an object")
     true_entry = criteria.get("true")
     false_entry = criteria.get("false")
     if true_entry is not None and false_entry is not None:
-        response = jev.request(attach_image({
+        return {
             "premise": premise(state, question["instructions"]),
             "hypotheses": [flatten(true_entry), flatten(false_entry)],
-        }, image))
-        true_p, _false_p = softmax(entailment_logits(response))
-        return {"type": "noul", "noul": true_p}, response
+        }, {"type": "noul", "binary": False}
     hypothesis = flatten(true_entry) if true_entry is not None else flatten(question["instructions"])
-    response = jev.request(attach_image({"pairs": [[flatten(state), hypothesis]]}, image))
-    return {"type": "noul", "noul": binary_truth(response["results"][0])}, response
+    return {"pairs": [[flatten(state), hypothesis]]}, {"type": "noul", "binary": True}
 
 
-def evaluate_choice(jev, state, question, image=None):
+def prepare_choice(state, question):
     criteria = question.get("criteria")
     if not isinstance(criteria, dict) or not criteria:
         raise RequestError("choice criteria must be a non-empty object")
@@ -580,33 +579,39 @@ def evaluate_choice(jev, state, question, image=None):
         options.append(flatten(value))
     if not keys:
         raise RequestError("choice requires at least one non-null option")
-    response = jev.request(attach_image({
+    return {
         "question": premise(state, question["instructions"]),
         "options": options,
-    }, image))
-    probabilities = dict(zip(keys, softmax(entailment_logits(response))))
-    choice = max(keys, key=lambda key: (probabilities[key], -keys.index(key)))
-    return {
-        "type": "choice",
-        "choice": choice,
-        "confidence": confidence(probabilities),
-        "probabilities": probabilities,
-    }, response
+    }, {"type": "choice", "keys": keys}
 
 
-def evaluate_score(jev, state, question, image=None):
+def prepare_score(state, question):
     criteria = question.get("criteria")
     if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
         raise RequestError("score criteria must be an array of 2 to 10 levels")
     levels = [flatten(item) for item in criteria]
     if any(not level for level in levels):
         raise RequestError("score levels must flatten to non-empty text")
-    response = jev.request(attach_image({
+    return {
         "premise": premise(state, question["instructions"]),
         "hypotheses": levels,
-    }, image))
+    }, {"type": "score", "criteria": criteria}
+
+
+def decode_question(meta, response):
+    kind = meta["type"]
+    if kind == "noul":
+        value = binary_truth(response["results"][0]) if meta["binary"] else softmax(entailment_logits(response))[0]
+        return {"type": "noul", "noul": value}
+    if kind == "choice":
+        keys = meta["keys"]
+        probabilities = dict(zip(keys, softmax(entailment_logits(response))))
+        choice = max(keys, key=lambda key: (probabilities[key], -keys.index(key)))
+        return {"type": "choice", "choice": choice, "confidence": confidence(probabilities),
+                "probabilities": probabilities}
+    criteria = meta["criteria"]
     weights = softmax(entailment_logits(response))
-    keys = [str(i) for i in range(len(levels))]
+    keys = [str(i) for i in range(len(criteria))]
     probabilities = dict(zip(keys, weights))
     return {
         "type": "score",
@@ -614,20 +619,34 @@ def evaluate_score(jev, state, question, image=None):
         "confidence": confidence(probabilities),
         "legend": {key: criteria[int(key)] for key in keys},
         "probabilities": probabilities,
-    }, response
+    }
 
 
-def evaluate_question(jev, state, question, image=None):
+def prepare_question(state, question):
     if not isinstance(question, dict) or "type" not in question or "instructions" not in question:
         raise RequestError("each question needs type and instructions")
     kind = question["type"]
     if kind == "noul":
-        return evaluate_noul(jev, state, question, image=image)
+        return prepare_noul(state, question)
     if kind == "choice":
-        return evaluate_choice(jev, state, question, image=image)
+        return prepare_choice(state, question)
     if kind == "score":
-        return evaluate_score(jev, state, question, image=image)
+        return prepare_score(state, question)
     raise RequestError(f"unsupported question type: {kind}")
+
+
+def evaluate_question(jev, state, question, image=None):
+    payload, meta = prepare_question(state, question)
+    response = jev.request(attach_image(payload, image))
+    return decode_question(meta, response), response
+
+
+def question_pairs(payload):
+    if "pairs" in payload:
+        return payload["pairs"]
+    if "options" in payload:
+        return [[payload["question"], "The correct answer is: " + option] for option in payload["options"]]
+    return [[payload["premise"], hypothesis] for hypothesis in payload["hypotheses"]]
 
 
 def known_model_ids():
@@ -791,6 +810,23 @@ def handle_request(get_encoder, payload):
                 "usage": {"input_tokens": int(response.get("evaluated_tokens") or 0), "output_tokens": 0},
             }
         answers = {}
+        if image and len(questions) > 1:
+            pairs, groups = [], []
+            for qid, question in questions.items():
+                rec, meta = prepare_question(state, question)
+                group = question_pairs(rec)
+                groups.append((str(qid), meta, len(group)))
+                pairs.extend(group)
+            response = jev.request(attach_image({"pairs": pairs}, image))
+            rows = response.get("results") or []
+            if len(rows) != len(pairs):
+                raise RequestError("encoder returned the wrong number of pairs", 500)
+            offset = 0
+            for qid, meta, count in groups:
+                answers[qid] = decode_question(meta, {"results": rows[offset:offset + count]})
+                offset += count
+            return {"model": model, "answers": answers,
+                    "usage": {"input_tokens": int(response.get("evaluated_tokens") or 0), "output_tokens": 0}}
         input_tokens = 0
         for qid, question in questions.items():
             answer, response = evaluate_question(jev, state, question, image=image)
@@ -823,7 +859,7 @@ def download_hf(subfolder, dest_parent):
 
 
 class ModelHub:
-    def __init__(self, root, *, binary, gpu_layers, threads, quantize_bin):
+    def __init__(self, root, *, binary, gpu_layers, threads, quantize_bin, inference_timeout=110.0):
         self.root = Path(root)
         self.models_dir = self.root / "models"
         self.hf_dir = self.models_dir / "openjev-hf"
@@ -831,6 +867,7 @@ class ModelHub:
         self.gpu_layers = gpu_layers
         self.threads = threads
         self.quantize_bin = quantize_bin
+        self.inference_timeout = inference_timeout
         self._lock = threading.Lock()
         self._loaded = {}
         self._jobs = {}
@@ -961,7 +998,9 @@ class ModelHub:
         cid = canonical_id(name)
         with self._lock:
             if cid in self._loaded:
-                return self._loaded[cid]
+                if self._loaded[cid].is_alive():
+                    return self._loaded[cid]
+                self._loaded.pop(cid).close()
             spec = CATALOG[cid]
             path = self.gguf_path(spec)
             if path is None:
@@ -975,6 +1014,7 @@ class ModelHub:
             self._loaded[cid] = OpenJevCrossEncoder(
                 path, binary=self.binary, mmproj=mmproj, ctx_size=ctx_size,
                 gpu_layers=self.gpu_layers, threads=self.threads,
+                inference_timeout=self.inference_timeout,
             )
             return self._loaded[cid]
 
@@ -1152,6 +1192,42 @@ boot();
 
 
 def make_handler(hub, store):
+    inference_slot = threading.BoundedSemaphore(1)
+    jobs = {}
+    jobs_lock = threading.Lock()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openjev-inference")
+
+    def run_inference(key, payload):
+        started = time.monotonic()
+        try:
+            with jobs_lock:
+                jobs[key]["status"] = "running"
+            if not inference_slot.acquire(blocking=False):
+                raise RequestError("inference busy; wait for the active request to finish", 429)
+            try:
+                result = handle_request(hub.encoder, payload)
+                usage = result.get("usage") or {}
+                return result, usage, (time.monotonic() - started) * 1000.0
+            finally:
+                inference_slot.release()
+        except Exception as exc:
+            with jobs_lock:
+                jobs[key].update(status="error", error=str(exc))
+            return None
+
+    def finish_job(future, job_id, api_key):
+        try:
+            result = future.result()
+            if result is None:
+                return
+            payload, usage, elapsed = result
+            store.record(api_key, usage.get("input_tokens") or 0, usage.get("output_tokens") or 0, elapsed)
+            with jobs_lock:
+                jobs[job_id].update(status="done", result=payload)
+        except Exception as exc:
+            with jobs_lock:
+                jobs[job_id].update(status="error", error=str(exc))
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -1231,6 +1307,16 @@ def make_handler(hub, store):
             if path == "/v1/models":
                 self._send(200, {"data": [{"id": name, "owned_by": "openjev"} for name in known_model_ids()]})
                 return
+            if path.startswith("/v1/jobs/"):
+                job_id = path.removeprefix("/v1/jobs/")
+                with jobs_lock:
+                    job = jobs.get(job_id)
+                    if job is None:
+                        self._send(404, {"error": "job not found"})
+                    else:
+                        response = {key: value for key, value in job.items() if key != "future"}
+                        self._send(200, response)
+                return
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -1276,12 +1362,33 @@ def make_handler(hub, store):
                 if not key:
                     self._send(401, {"error": "unauthorized"})
                     return
-                started = time.time()
-                result = handle_request(hub.encoder, self._read_json())
-                usage = result.get("usage") or {}
-                store.record(key["id"], usage.get("input_tokens") or 0, usage.get("output_tokens") or 0,
-                             (time.time() - started) * 1000.0)
-                self._send(200, result)
+                payload = self._read_json()
+                if urlparse(self.path).query == "async=1":
+                    job_id = uuid.uuid4().hex
+                    with jobs_lock:
+                        jobs[job_id] = {"id": job_id, "status": "queued", "created": time.time()}
+                    future = executor.submit(run_inference, job_id, payload)
+                    with jobs_lock:
+                        jobs[job_id]["future"] = future
+                    future.add_done_callback(lambda completed, jid=job_id, kid=key["id"]:
+                                             finish_job(completed, jid, kid))
+                    self._send(202, {"id": job_id, "status": "queued", "poll": "/v1/jobs/" + job_id})
+                    return
+                if not inference_slot.acquire(blocking=False):
+                    raise RequestError("inference busy; wait for the active request to finish", 429)
+                try:
+                    started = time.monotonic()
+                    result = handle_request(hub.encoder, payload)
+                    usage = result.get("usage") or {}
+                    store.record(key["id"], usage.get("input_tokens") or 0, usage.get("output_tokens") or 0,
+                                 (time.monotonic() - started) * 1000.0)
+                    self._send(200, result)
+                finally:
+                    inference_slot.release()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except TimeoutError as exc:
+                self._send(504, {"error": str(exc)})
             except RequestError as exc:
                 self._send(exc.status, {"error": str(exc)})
             except ValueError as exc:
@@ -1300,14 +1407,19 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--gpu-layers", type=int, default=99)
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--inference-timeout", type=float, default=110.0,
+                        help="Kill stalled model requests after this many seconds (default 110)")
     parser.add_argument("--admin-file", default=str(ADMIN_FILE))
     args = parser.parse_args()
+    if not math.isfinite(args.inference_timeout) or args.inference_timeout <= 0:
+        parser.error("--inference-timeout must be positive and finite")
     binary = args.binary or str(ROOT / "build" / "bin" / "openjev")
     store = AdminStore(args.admin_file)
     if args.api_key:
         store.add_known_key(args.api_key, "cli")
     hub = ModelHub(ROOT, binary=binary, gpu_layers=args.gpu_layers, threads=args.threads,
-                   quantize_bin=str(ROOT / "build" / "bin" / "llama-quantize"))
+                   quantize_bin=str(ROOT / "build" / "bin" / "llama-quantize"),
+                   inference_timeout=args.inference_timeout)
     try:
         server = ThreadingHTTPServer((args.host, args.port), make_handler(hub, store))
         print(f"openjev admin http://{args.host}:{args.port}/", flush=True)
@@ -1321,6 +1433,7 @@ def main():
             pass
         finally:
             server.server_close()
+            executor.shutdown(wait=True, cancel_futures=True)
     finally:
         hub.close()
 
