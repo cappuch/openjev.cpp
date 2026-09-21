@@ -970,9 +970,10 @@ class ModelHub:
                     404,
                 )
             mmproj = self.mmproj_path(spec)
-            print(f"openjev: loading {cid} from {path.name}", flush=True)
+            ctx_size = 8192 if mmproj else 4096
+            print(f"openjev: loading {cid} from {path.name} (ctx {ctx_size})", flush=True)
             self._loaded[cid] = OpenJevCrossEncoder(
-                path, binary=self.binary, mmproj=mmproj,
+                path, binary=self.binary, mmproj=mmproj, ctx_size=ctx_size,
                 gpu_layers=self.gpu_layers, threads=self.threads,
             )
             return self._loaded[cid]
