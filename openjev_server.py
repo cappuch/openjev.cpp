@@ -405,6 +405,41 @@ IMAGE_OBJECT_KEYS = {
 }
 
 
+MAX_PATH_CHARS = 1024
+
+
+def _existing_file(value):
+    if not isinstance(value, str) or len(value) > MAX_PATH_CHARS or "\n" in value:
+        return None
+    try:
+        path = Path(value)
+        if path.is_file():
+            return str(path.resolve())
+    except OSError:
+        return None
+    return None
+
+
+def _decode_b64_image(text, mime=None):
+    if not isinstance(text, str) or len(text) < 8:
+        return None
+    try:
+        blob = base64.b64decode(text, validate=False)
+    except Exception:
+        return None
+    if not blob:
+        return None
+    if mime:
+        return blob, _mime_suffix(mime)
+    if blob[:3] == b"\xff\xd8\xff":
+        return blob, ".jpg"
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return blob, ".png"
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return blob, ".webp"
+    return blob, ".png"
+
+
 def _image_from_mapping(value, directory):
     if not isinstance(value, dict):
         return None
@@ -432,16 +467,9 @@ def _image_from_mapping(value, directory):
         path = materialize_image(candidate, directory)
         if path:
             return path
-        if isinstance(candidate, str) and not candidate.startswith("data:") and not Path(candidate).is_file():
-            try:
-                blob = base64.b64decode(candidate, validate=False)
-            except Exception:
-                blob = b""
-            if blob:
-                return _write_image(directory, blob, _mime_suffix(mime if isinstance(mime, str) else "image/png"))
-    if typed:
-        raise RequestError("image object is missing data or a file path")
-    return None
+        decoded = _decode_b64_image(candidate, mime if isinstance(mime, str) else None)
+        if decoded:
+            return _write_image(directory, decoded[0], decoded[1])
     if typed:
         raise RequestError("image object is missing data or a file path")
     return None
@@ -450,13 +478,13 @@ def _image_from_mapping(value, directory):
 def materialize_image(value, directory):
     if value is None:
         return None
-    decoded = _decode_data_url(value) if isinstance(value, str) else None
-    if decoded:
-        return _write_image(directory, decoded[0], decoded[1])
     if isinstance(value, str):
-        path = Path(value)
-        if path.is_file():
-            return str(path.resolve())
+        decoded = _decode_data_url(value)
+        if decoded:
+            return _write_image(directory, decoded[0], decoded[1])
+        existing = _existing_file(value)
+        if existing:
+            return existing
         if value.startswith("data:"):
             raise RequestError("only data:image/... URLs are supported")
         return None

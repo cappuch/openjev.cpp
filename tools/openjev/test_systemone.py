@@ -182,6 +182,37 @@ class HandleTests(unittest.TestCase):
         self.assertTrue(seen["image"])
         self.assertTrue(Path(seen["image"]).name.startswith("input"))
 
+    def test_jpeg_base64_is_not_treated_as_a_path(self):
+        import base64
+        from pathlib import Path
+
+        seen = {}
+        jpeg = b"\xff\xd8\xff" + b"\x00" * 8000
+        payload_b64 = base64.b64encode(jpeg).decode()
+        self.assertGreater(len(payload_b64), 1024)
+        self.assertTrue(payload_b64.startswith("/9j/"))
+
+        def fake_request(payload):
+            seen["image"] = payload.get("image")
+            path = Path(payload["image"])
+            self.assertTrue(path.is_file())
+            self.assertLess(len(str(path)), 1024)
+            return {"results": [{"logits": [0.0, 1.0, 0.0]}], "evaluated_tokens": 3}
+
+        self.jev.request.side_effect = fake_request
+        handle_request(self.get_encoder, {
+            "state": {
+                "screenshot": {
+                    "type": "image",
+                    "media_type": "image/jpeg",
+                    "data": payload_b64,
+                },
+            },
+            "model": "openjev_0.8b",
+            "questions": {"q": {"type": "noul", "instructions": "Is there a window?"}},
+        })
+        self.assertTrue(seen["image"].endswith(".jpg"))
+
     def test_catalog_has_no_auto_install_flag(self):
         from openjev_server import CATALOG
         for spec in CATALOG.values():
