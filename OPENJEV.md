@@ -77,7 +77,7 @@ curl -sS http://127.0.0.1:8080/v1/systemone \
   -d '{"state":"The door is red.","model":"openjev_0.8b","questions":{"colour":{"type":"choice","instructions":"What colour is the door?","criteria":{"red":"red","blue":"blue"}}}}'
 ```
 
-`POST /v1/systemone` accepts `state`, `model`, and `questions` keyed by caller IDs. Those keys are echoed in `answers` and are not sent to the model. Question types:
+`POST /v1/systemone` accepts `state`, `model`, and `questions` keyed by caller IDs. Those keys are echoed in `answers` and are not sent to the model. Booleans flatten to `true`/`false`. One image may be sent per request as a top-level `image` path/data-URL, or nested in `state` as `{"type":"image","media_type":"image/png","data":"<base64>"}`. Images are scored through mtmd (requires the model's mmproj). Kev rejects images. Question types:
 
 - `noul`: truth score in `[0, 1]`. On openjev, optional `criteria.true` / `criteria.false` are two hypotheses; otherwise the instructions are scored against the state. On kev, options are `no`/`yes` (with those criteria texts when present) and `noul` is p(yes).
 - `choice`: up to 255 options. Openjev softmaxes entailment logits with the rerank wrapper `The correct answer is: `. Kev softmaxes pointer logits over `name` / `name: desc`. `choice` is the argmax, first option on a tie. Null criteria are skipped.
