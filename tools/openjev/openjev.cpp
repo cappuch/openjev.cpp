@@ -486,8 +486,9 @@ public:
                               : (opt.latents ? LLAMA_POOLING_TYPE_LAST : LLAMA_POOLING_TYPE_RANK);
         cp.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
         if (laya) {
-            cp.n_ctx = cp.n_batch = cp.n_ubatch = laya->max_length();
-            cp.n_seq_max = 1;
+            cp.n_seq_max = 8;
+            cp.n_ctx = cp.n_seq_max * laya->max_length();
+            cp.n_batch = cp.n_ubatch = std::min(opt.context, 1024);
             cp.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
         }
         ctx.reset(llama_init_from_model(model.get(), cp));

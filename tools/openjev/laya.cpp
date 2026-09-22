@@ -53,19 +53,31 @@ struct laya_head::impl {
         return ggml_add(c, ggml_mul(c, ggml_norm(c, x, 1e-5f), tensor(name + ".weight", d)), tensor(name + ".bias", d));
     }
 
-    std::vector<float> evaluate(const float * embeddings, int length, int qtype,
-                                const std::vector<int32_t> & markers, float & act_probability) {
-        const size_t graph_size = 512;
+    std::vector<std::vector<float>> evaluate(const float * embeddings, const std::vector<int> & lengths,
+                                            const std::vector<int> & qtypes,
+                                            const std::vector<std::vector<int32_t>> & markers,
+                                            std::vector<float> & act_probabilities) {
+        std::vector<int32_t> types, positions_data, starts;
+        int length = 0;
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            starts.push_back(length);
+            types.insert(types.end(), lengths[i], qtypes[i]);
+            for (int32_t pos : markers[i]) { positions_data.push_back(length + pos); }
+            length += lengths[i];
+        }
+        const size_t graph_size = 512 + 64 * lengths.size();
         ggml_init_params params{ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false), nullptr, true};
         std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init(params), ggml_free);
         if (!context) { throw std::runtime_error("cannot allocate Laya graph"); }
         auto * c = context.get();
         auto * input = ggml_new_tensor_2d(c, GGML_TYPE_F32, d, length);
-        auto * type = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
-        auto * positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, markers.size());
+        auto * type = ggml_new_tensor_1d(c, GGML_TYPE_I32, length);
+        auto * positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, positions_data.size());
+        auto * pool_positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, starts.size());
         ggml_set_input(input);
         ggml_set_input(type);
         ggml_set_input(positions);
+        ggml_set_input(pool_positions);
         auto * h = ggml_add(c, input, ggml_get_rows(c, tensor("type_emb.weight", d, 3), type));
         const int heads = d / 64;
         for (int i = 0; i < cfg.at("head_layers").get<int>(); ++i) {
@@ -73,16 +85,23 @@ struct laya_head::impl {
             auto * x = norm(c, h, prefix + ".norm1");
             auto * qkv = ggml_add(c, ggml_mul_mat(c, tensor(prefix + ".self_attn.in_proj_weight", d, 3 * d), x),
                                  tensor(prefix + ".self_attn.in_proj_bias", 3 * d));
-            auto part = [&](int index) {
-                auto * v = ggml_cont(c, ggml_view_2d(c, qkv, d, length, qkv->nb[1], index * d * sizeof(float)));
-                return ggml_permute(c, ggml_reshape_3d(c, v, 64, heads, length), 0, 2, 1, 3);
-            };
-            auto * q = part(0);
-            auto * k = part(1);
-            auto * v = ggml_cont(c, ggml_permute(c, part(2), 1, 0, 2, 3));
-            auto * scores = ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, k, q), 1.f / 8.f));
-            x = ggml_mul_mat(c, v, scores);
-            x = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, x, 0, 2, 1, 3)), d, length);
+            ggml_tensor * attention = nullptr;
+            // Share projections across questions, but keep their attention independent.
+            for (size_t seq = 0; seq < lengths.size(); ++seq) {
+                const int n = lengths[seq];
+                auto part = [&](int index) {
+                    auto * v = ggml_cont(c, ggml_view_2d(c, qkv, d, n, qkv->nb[1], starts[seq] * qkv->nb[1] + index * d * sizeof(float)));
+                    return ggml_permute(c, ggml_reshape_3d(c, v, 64, heads, n), 0, 2, 1, 3);
+                };
+                auto * q = part(0);
+                auto * k = part(1);
+                auto * v = ggml_cont(c, ggml_permute(c, part(2), 1, 0, 2, 3));
+                auto * scores = ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, k, q), 1.f / 8.f));
+                x = ggml_mul_mat(c, v, scores);
+                x = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, x, 0, 2, 1, 3)), d, n);
+                attention = attention ? ggml_concat(c, attention, x, 1) : x;
+            }
+            x = attention;
             h = ggml_add(c, h, linear(c, x, prefix + ".self_attn.out_proj", d));
             x = norm(c, h, prefix + ".norm2");
             x = ggml_relu(c, linear(c, x, prefix + ".linear1", 4 * d));
@@ -90,7 +109,7 @@ struct laya_head::impl {
         }
         auto * selected = ggml_get_rows(c, h, positions);
         auto * logits = linear(c, ggml_gelu_erf(c, linear(c, norm(c, selected, "scorer.0"), "scorer.1", d)), "scorer.3", 1);
-        auto * pooled = ggml_cont(c, ggml_view_1d(c, h, d, 0));
+        auto * pooled = ggml_get_rows(c, h, pool_positions);
         ggml_set_output(logits);
         ggml_set_output(pooled);
         auto * graph = ggml_new_graph_custom(c, graph_size, false);
@@ -100,23 +119,30 @@ struct laya_head::impl {
             ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())), ggml_gallocr_free);
         if (!ggml_gallocr_alloc_graph(alloc.get(), graph)) { throw std::runtime_error("cannot allocate Laya buffers"); }
         ggml_backend_tensor_set(input, embeddings, 0, size_t(d) * length * sizeof(float));
-        const int32_t qt = qtype;
-        ggml_backend_tensor_set(type, &qt, 0, sizeof(qt));
-        ggml_backend_tensor_set(positions, markers.data(), 0, markers.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(type, types.data(), 0, types.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(positions, positions_data.data(), 0, positions_data.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(pool_positions, starts.data(), 0, starts.size() * sizeof(int32_t));
         if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("Laya head failed"); }
-        std::vector<float> result(markers.size()), features(d + 4);
-        ggml_backend_tensor_get(logits, result.data(), 0, result.size() * sizeof(float));
-        ggml_backend_tensor_get(pooled, features.data(), 0, d * sizeof(float));
-        auto p = probabilities(result);
-        double entropy = 0;
-        for (float value : p) { entropy -= value * std::log(std::max(value, 1e-9f)); }
-        std::sort(p.begin(), p.end(), std::greater<float>());
-        features[d] = p[0];
-        features[d + 1] = p[0] - p[1];
-        features[d + 2] = entropy / std::log(double(p.size()));
-        features[d + 3] = p.size() / 255.f;
+        std::vector<std::vector<float>> result(lengths.size());
+        std::vector<float> features((d + 4) * lengths.size());
+        size_t offset = 0;
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            result[i].resize(markers[i].size());
+            ggml_backend_tensor_get(logits, result[i].data(), offset * sizeof(float), result[i].size() * sizeof(float));
+            offset += result[i].size();
+            auto * feature = features.data() + (d + 4) * i;
+            ggml_backend_tensor_get(pooled, feature, i * d * sizeof(float), d * sizeof(float));
+            auto p = probabilities(result[i]);
+            double entropy = 0;
+            for (float value : p) { entropy -= value * std::log(std::max(value, 1e-9f)); }
+            std::sort(p.begin(), p.end(), std::greater<float>());
+            feature[d] = p[0];
+            feature[d + 1] = p[0] - p[1];
+            feature[d + 2] = entropy / std::log(double(p.size()));
+            feature[d + 3] = p.size() / 255.f;
+        }
 
-        auto * act_input = ggml_new_tensor_1d(c, GGML_TYPE_F32, d + 4);
+        auto * act_input = ggml_new_tensor_2d(c, GGML_TYPE_F32, d + 4, lengths.size());
         ggml_set_input(act_input);
         auto * act = linear(c, ggml_gelu_erf(c, linear(c, act_input, "act_head.0", 256)), "act_head.2", 2);
         auto * act_graph = ggml_new_graph_custom(c, 32, false);
@@ -124,9 +150,12 @@ struct laya_head::impl {
         if (!ggml_gallocr_alloc_graph(alloc.get(), act_graph)) { throw std::runtime_error("cannot allocate Laya act buffers"); }
         ggml_backend_tensor_set(act_input, features.data(), 0, features.size() * sizeof(float));
         if (ggml_backend_graph_compute(backend.get(), act_graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("Laya act head failed"); }
-        std::vector<float> act_logits(2);
-        ggml_backend_tensor_get(act, act_logits.data(), 0, 2 * sizeof(float));
-        act_probability = probabilities(act_logits)[0];
+        act_probabilities.resize(lengths.size());
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            std::vector<float> act_logits(2);
+            ggml_backend_tensor_get(act, act_logits.data(), i * 2 * sizeof(float), 2 * sizeof(float));
+            act_probabilities[i] = probabilities(act_logits)[0];
+        }
         return result;
     }
 };
@@ -190,6 +219,13 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
     if (!questions.is_array() || questions.empty()) { throw std::runtime_error("Laya requires a non-empty questions array"); }
     json rows = json::array();
     size_t token_count = 0;
+    struct encoded_question {
+        std::vector<llama_token> tokens;
+        std::vector<int32_t> markers;
+        int type;
+        float temperature;
+    };
+    std::vector<encoded_question> encoded;
     for (const auto & question : questions) {
         const std::string kind = question.at("type").get<std::string>();
         const int qt = kind == "choice" ? 0 : kind == "score" ? 1 : kind == "noul" ? 2 : -1;
@@ -229,25 +265,51 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
         tokens.push_back(sep);
         tokens.resize(std::min(tokens.size(), size_t(max_length())));
         if (markers.back() >= int(tokens.size())) { throw std::runtime_error("Laya options do not fit in token budget"); }
-        auto batch = llama_batch_init(tokens.size(), 0, 1);
+        const std::string bucket = kind + ":" + (options.size() <= 2 ? "2" : options.size() <= 5 ? "3-5" : options.size() <= 10 ? "6-10" : "11+");
+        const auto temperatures = data->cfg.value("temperature", std::vector<float>{1, 1, 1});
+        const float temperature = data->cfg.value("temperature_by_options", json::object()).value(bucket, temperatures[qt]);
+        token_count += tokens.size();
+        encoded.push_back({std::move(tokens), std::move(markers), qt, temperature});
+    }
+    size_t batches = 0;
+    for (size_t begin = 0; begin < encoded.size();) {
+        size_t end = begin, count = 0;
+        while (end < encoded.size() && end - begin < llama_n_seq_max(ctx) &&
+               count + encoded[end].tokens.size() <= llama_n_ubatch(ctx)) {
+            count += encoded[end++].tokens.size();
+        }
+        if (end == begin) { throw std::runtime_error("Laya question exceeds encoder batch capacity"); }
+        auto batch = llama_batch_init(count, 0, 1);
         common_batch_clear(batch);
-        for (size_t i = 0; i < tokens.size(); ++i) { common_batch_add(batch, tokens[i], i, {0}, true); }
+        std::vector<int> lengths, types;
+        std::vector<std::vector<int32_t>> positions;
+        for (size_t q = begin; q < end; ++q) {
+            const auto & item = encoded[q];
+            lengths.push_back(item.tokens.size());
+            types.push_back(item.type);
+            positions.push_back(item.markers);
+            for (size_t i = 0; i < item.tokens.size(); ++i) {
+                common_batch_add(batch, item.tokens[i], i, {llama_seq_id(q - begin)}, true);
+            }
+        }
         const int status = llama_encode(ctx, batch);
         llama_batch_free(batch);
         if (status != 0) { throw std::runtime_error("Laya encoder failed"); }
-        std::vector<float> embeddings(tokens.size() * data->d);
-        for (size_t i = 0; i < tokens.size(); ++i) {
+        std::vector<float> embeddings(count * data->d);
+        for (size_t i = 0; i < count; ++i) {
             const auto * values = llama_get_embeddings_ith(ctx, i);
             if (!values) { throw std::runtime_error("missing Laya encoder embedding"); }
             std::copy(values, values + data->d, embeddings.begin() + i * data->d);
         }
-        float act = 0;
-        const auto logits = data->evaluate(embeddings.data(), tokens.size(), qt, markers, act);
-        const std::string bucket = kind + ":" + (options.size() <= 2 ? "2" : options.size() <= 5 ? "3-5" : options.size() <= 10 ? "6-10" : "11+");
-        const auto temperatures = data->cfg.value("temperature", std::vector<float>{1, 1, 1});
-        const float temperature = data->cfg.value("temperature_by_options", json::object()).value(bucket, temperatures[qt]);
-        rows.push_back(json::object({{"logits", logits}, {"probabilities", probabilities(logits, temperature)}, {"act_probability", act}}));
-        token_count += tokens.size();
+        std::vector<float> acts;
+        const auto logits = data->evaluate(embeddings.data(), lengths, types, positions, acts);
+        for (size_t q = begin; q < end; ++q) {
+            const auto & values = logits[q - begin];
+            rows.push_back(json::object({{"logits", values}, {"probabilities", probabilities(values, encoded[q].temperature)},
+                                         {"act_probability", acts[q - begin]}}));
+        }
+        ++batches;
+        begin = end;
     }
-    return json::object({{"results", rows}, {"evaluated_tokens", token_count}, {"prefix_tokens", 0}});
+    return json::object({{"results", rows}, {"evaluated_tokens", token_count}, {"prefix_tokens", 0}, {"batches", batches}});
 }

@@ -27,7 +27,9 @@ def test_laya(args):
     long_question = {"q": {"type": "choice", "instructions": "word " * 250,
                            "criteria": {"red": "red " * 100, "blue": "blue " * 100, "other": "other " * 100,
                                         "four": "four " * 100, "five": "five " * 100}}}
-    cases = [(state, questions), ("The door is red. " * 200, long_question)]
+    long_state = "The door is red. " * 200
+    cases = [(state, questions), (long_state, long_question),
+             (long_state, {f"q{i}": long_question["q"] for i in range(3)})]
     observed = []
     with OpenJevCrossEncoder(args.model, binary=args.binary, gpu_layers=args.gpu_layers) as jev:
         for state, qs in cases:
@@ -35,12 +37,20 @@ def test_laya(args):
             raw = jev.request(payload)
             observed.append(raw)
             assert all(abs(sum(r["probabilities"]) - 1) < 1e-6 for r in raw["results"])
+        assert [row["batches"] for row in observed] == [1, 1, 2]
         payload, _ = laya_payload(*cases[0])
         again = jev.request(payload)
         compare([r["logits"] for r in again["results"]], [r["logits"] for r in observed[0]["results"]], 1e-5)
         reversed_payload = {**payload, "questions": list(reversed(payload["questions"]))}
         reversed_rows = jev.request(reversed_payload)["results"]
-        compare([r["logits"] for r in reversed_rows], [r["logits"] for r in reversed(observed[0]["results"])], 1e-5)
+        compare([r["logits"] for r in reversed_rows], [r["logits"] for r in reversed(observed[0]["results"])], 0.01)
+        singles = [jev.request({**payload, "questions": [q]}) for q in payload["questions"]]
+        compare([r["results"][0]["logits"] for r in singles], [r["logits"] for r in observed[0]["results"]], 0.03)
+        compare([r["results"][0]["probabilities"] for r in singles], [r["probabilities"] for r in observed[0]["results"]], 0.003)
+        assert sum(r["evaluated_tokens"] for r in singles) == observed[0]["evaluated_tokens"]
+        overflow = jev.request({**payload, "questions": [payload["questions"][0]] * 17})
+        assert overflow["batches"] == 3 and len(overflow["results"]) == 17
+        compare([r["logits"] for r in overflow["results"]], [singles[0]["results"][0]["logits"]] * 17, 0.03)
         for bad in [{"state": "x", "questions": []},
                     {"state": "x", "questions": [{"type": "bad", "options": ["a", "b"], "instr": "x"}]},
                     {"state": "x", "questions": [{"type": "choice", "options": ["a"], "instr": "x"}]},
@@ -55,7 +65,7 @@ def test_laya(args):
         assert answers["color"]["choice"] == "red"
         assert answers["refund"]["noul"] > 0.5
         assert 0 <= answers["urgency"]["score"] <= 2
-    print("PASS Laya typed answers, long-input truncation, repeated/reordered questions and error recovery")
+    print("PASS Laya batching, independent/reordered questions, batch limits, truncation and error recovery")
     if not args.hf_model:
         return
     import torch

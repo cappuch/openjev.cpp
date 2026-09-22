@@ -15,7 +15,7 @@ python tools/openjev/convert_laya.py --out-dir models
 
 Conversion downloads only the English checkpoint and produces `models/laya-f16.gguf` and `models/laya.head.gguf`. For an existing download, pass `--model-dir /path/to/laya`. Keep both GGUFs in the same directory. Conversion refuses to overwrite existing output files.
 
-The server model catalog also offers `laya` (alias `laya-latest`); its install action runs this converter. The encoder uses the configured GPU layers; the decision head currently runs on CPU with `--threads`. Questions are processed independently without padding or prefix caching. A request can contain multiple questions, but they are evaluated sequentially.
+The server model catalog also offers `laya` (alias `laya-latest`); its install action runs this converter. The encoder uses the configured GPU layers; the decision head currently runs on CPU with `--threads`. Questions are packed without padding into batches of up to eight questions and 1,024 total tokens (or `--ctx-size` if smaller). Each batch uses one encoder call and shares the head's projections and feed-forward operations. Attention stays isolated per question. Larger requests are split automatically, with output order preserved. The JSONL response reports the number of batches in `batches`.
 
 ## Python
 
