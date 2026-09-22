@@ -36,6 +36,19 @@ Laya (English ModernBERT-large plus the decision head, F16, Apple M5, 4 threads)
 
 Metal is about 2x PyTorch MPS on these requests. CPU is still slower than PyTorch CPU.
 
+One short decision on the same machine, including the OpenJev Q4 models that are on disk. OpenJev times are one NLI hypothesis. Laya times are the 67-token choice question above.
+
+![One short decision, Apple M5](docs/speed-comparison.png)
+
+| Model | CPU | GPU |
+| --- | ---: | ---: |
+| OpenJev 0.8B Q4 | 101 ms | 41 ms Metal |
+| OpenJev 4B Q4 | 967 ms | 264 ms Metal |
+| Laya F16 | 356 ms | 37 ms Metal |
+| PyTorch Laya fp32 | 154 ms | 72 ms MPS |
+
+Four hypotheses with prefix cache: OpenJev 0.8B Q4 is 295 ms CPU / 120 ms Metal, and OpenJev 4B Q4 is 1.37 s CPU / 777 ms Metal. Kev checkpoints are not converted here, so they are not on the chart.
+
 ---
 
 # llama.cpp (upstream)
