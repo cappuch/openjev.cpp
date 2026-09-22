@@ -448,7 +448,7 @@ public:
             }
             if (opt.latents || !opt.mmproj.empty()) { throw std::runtime_error("Laya does not support --latents or --mmproj"); }
             const auto path = std::filesystem::path(opt.model).parent_path() / laya_file;
-            laya.reset(new laya_head(path.string(), n_embd, opt.threads));
+            laya.reset(new laya_head(path.string(), n_embd, opt.threads, opt.gpu_layers != 0));
             if (opt.context < laya->max_length()) { throw std::runtime_error("Laya requires --ctx-size >= 512"); }
         }
         const std::string head = kev_head_path(opt.model);

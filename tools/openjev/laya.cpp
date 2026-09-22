@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -33,7 +34,10 @@ static std::string sanitize(std::string text) {
 struct laya_head::impl {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights{nullptr, ggml_free};
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend{nullptr, ggml_backend_free};
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> accelerator{nullptr, ggml_backend_free};
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu{nullptr, ggml_backend_free};
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer{nullptr, ggml_backend_buffer_free};
+    std::unique_ptr<ggml_backend_sched, decltype(&ggml_backend_sched_free)> scheduler{nullptr, ggml_backend_sched_free};
     json cfg;
     int d;
 
@@ -69,6 +73,10 @@ struct laya_head::impl {
         ggml_init_params params{ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false), nullptr, true};
         std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init(params), ggml_free);
         if (!context) { throw std::runtime_error("cannot allocate Laya graph"); }
+        struct reset_guard {
+            ggml_backend_sched_t scheduler;
+            ~reset_guard() { ggml_backend_sched_reset(scheduler); }
+        } reset{scheduler.get()};
         auto * c = context.get();
         auto * input = ggml_new_tensor_2d(c, GGML_TYPE_F32, d, length);
         auto * type = ggml_new_tensor_1d(c, GGML_TYPE_I32, length);
@@ -115,14 +123,12 @@ struct laya_head::impl {
         auto * graph = ggml_new_graph_custom(c, graph_size, false);
         ggml_build_forward_expand(graph, logits);
         ggml_build_forward_expand(graph, pooled);
-        std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> alloc(
-            ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())), ggml_gallocr_free);
-        if (!ggml_gallocr_alloc_graph(alloc.get(), graph)) { throw std::runtime_error("cannot allocate Laya buffers"); }
+        if (!ggml_backend_sched_alloc_graph(scheduler.get(), graph)) { throw std::runtime_error("cannot allocate Laya buffers"); }
         ggml_backend_tensor_set(input, embeddings, 0, size_t(d) * length * sizeof(float));
         ggml_backend_tensor_set(type, types.data(), 0, types.size() * sizeof(int32_t));
         ggml_backend_tensor_set(positions, positions_data.data(), 0, positions_data.size() * sizeof(int32_t));
         ggml_backend_tensor_set(pool_positions, starts.data(), 0, starts.size() * sizeof(int32_t));
-        if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("Laya head failed"); }
+        if (ggml_backend_sched_graph_compute(scheduler.get(), graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("Laya head failed"); }
         std::vector<std::vector<float>> result(lengths.size());
         std::vector<float> features((d + 4) * lengths.size());
         size_t offset = 0;
@@ -142,14 +148,15 @@ struct laya_head::impl {
             feature[d + 3] = p.size() / 255.f;
         }
 
+        ggml_backend_sched_reset(scheduler.get());
         auto * act_input = ggml_new_tensor_2d(c, GGML_TYPE_F32, d + 4, lengths.size());
         ggml_set_input(act_input);
         auto * act = linear(c, ggml_gelu_erf(c, linear(c, act_input, "act_head.0", 256)), "act_head.2", 2);
         auto * act_graph = ggml_new_graph_custom(c, 32, false);
         ggml_build_forward_expand(act_graph, act);
-        if (!ggml_gallocr_alloc_graph(alloc.get(), act_graph)) { throw std::runtime_error("cannot allocate Laya act buffers"); }
+        if (!ggml_backend_sched_alloc_graph(scheduler.get(), act_graph)) { throw std::runtime_error("cannot allocate Laya act buffers"); }
         ggml_backend_tensor_set(act_input, features.data(), 0, features.size() * sizeof(float));
-        if (ggml_backend_graph_compute(backend.get(), act_graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("Laya act head failed"); }
+        if (ggml_backend_sched_graph_compute(scheduler.get(), act_graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("Laya act head failed"); }
         act_probabilities.resize(lengths.size());
         for (size_t i = 0; i < lengths.size(); ++i) {
             std::vector<float> act_logits(2);
@@ -160,7 +167,7 @@ struct laya_head::impl {
     }
 };
 
-laya_head::laya_head(const std::string & path, int n_embd, int threads) : data(new impl) {
+laya_head::laya_head(const std::string & path, int n_embd, int threads, bool use_gpu) : data(new impl) {
     data->d = n_embd;
     ggml_context * weights = nullptr;
     gguf_init_params params{true, &weights};
@@ -183,12 +190,28 @@ laya_head::laya_head(const std::string & path, int n_embd, int threads) : data(n
     for (float t : temps) {
         if (!std::isfinite(t) || t <= 0) { throw std::runtime_error("invalid Laya temperature"); }
     }
-    data->backend.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
-    if (!data->backend) { throw std::runtime_error("Laya head requires a CPU backend"); }
-    const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(data->backend.get()));
-    auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
-    if (set_threads) { set_threads(data->backend.get(), threads); }
-    data->buffer.reset(ggml_backend_alloc_ctx_tensors(data->weights.get(), data->backend.get()));
+    data->cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    if (!data->cpu) { throw std::runtime_error("Laya head requires a CPU backend"); }
+    if (use_gpu) {
+        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!device) { device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU); }
+        if (device) { data->backend.reset(ggml_backend_dev_init(device, nullptr)); }
+    }
+    if (!data->backend) {
+        data->accelerator.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr));
+    }
+    std::vector<ggml_backend_t> backends;
+    if (data->backend) { backends.push_back(data->backend.get()); }
+    if (data->accelerator) { backends.push_back(data->accelerator.get()); }
+    backends.push_back(data->cpu.get());
+    for (auto * backend : backends) {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+        if (set_threads) { set_threads(backend, threads); }
+    }
+    data->scheduler.reset(ggml_backend_sched_new(backends.data(), nullptr, backends.size(), 1024, false, true));
+    if (!data->scheduler) { throw std::runtime_error("cannot create Laya scheduler"); }
+    data->buffer.reset(ggml_backend_alloc_ctx_tensors(data->weights.get(), data->backend ? data->backend.get() : data->cpu.get()));
     if (!data->buffer) { throw std::runtime_error("cannot allocate Laya weights"); }
     ggml_backend_buffer_set_usage(data->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::ifstream stream(path, std::ios::binary);
@@ -272,6 +295,7 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
         encoded.push_back({std::move(tokens), std::move(markers), qt, temperature});
     }
     size_t batches = 0;
+    double encoder_ms = 0, head_ms = 0;
     for (size_t begin = 0; begin < encoded.size();) {
         size_t end = begin, count = 0;
         while (end < encoded.size() && end - begin < llama_n_seq_max(ctx) &&
@@ -292,6 +316,7 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
                 common_batch_add(batch, item.tokens[i], i, {llama_seq_id(q - begin)}, true);
             }
         }
+        const auto encoder_start = std::chrono::steady_clock::now();
         const int status = llama_encode(ctx, batch);
         llama_batch_free(batch);
         if (status != 0) { throw std::runtime_error("Laya encoder failed"); }
@@ -302,7 +327,10 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
             std::copy(values, values + data->d, embeddings.begin() + i * data->d);
         }
         std::vector<float> acts;
+        const auto head_start = std::chrono::steady_clock::now();
+        encoder_ms += std::chrono::duration<double, std::milli>(head_start - encoder_start).count();
         const auto logits = data->evaluate(embeddings.data(), lengths, types, positions, acts);
+        head_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - head_start).count();
         for (size_t q = begin; q < end; ++q) {
             const auto & values = logits[q - begin];
             rows.push_back(json::object({{"logits", values}, {"probabilities", probabilities(values, encoded[q].temperature)},
@@ -311,5 +339,6 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
         ++batches;
         begin = end;
     }
-    return json::object({{"results", rows}, {"evaluated_tokens", token_count}, {"prefix_tokens", 0}, {"batches", batches}});
+    return json::object({{"results", rows}, {"evaluated_tokens", token_count}, {"prefix_tokens", 0}, {"batches", batches},
+                         {"encoder_ms", encoder_ms}, {"head_ms", head_ms}});
 }
