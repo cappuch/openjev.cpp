@@ -10,6 +10,97 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from openjev import OpenJevCrossEncoder
 
 
+def test_laya(args):
+    import json
+    from openjev import laya_payload
+    state = {"body": "The door is red. Please refund the duplicate charge today.", "note": "caf\u00e9 [MASK]"}
+    questions = {
+        "color": {"type": "choice", "instructions": "What color is the door?", "criteria": ["red", "blue"]},
+        "department": {"type": "choice", "instructions": "Which department should handle this?",
+                       "criteria": {"billing": "refunds", "support": "technical problems", "other": None}},
+        "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["low", "medium", "high"]},
+        "refund": {"type": "noul", "instructions": "Does the sender request a refund?"},
+        "many": {"type": "choice", "instructions": {"task": "Choose the color [MASK]"},
+                 "criteria": ["red", "blue", "green", "black", "white", "yellow", "orange"]},
+        "bucket11": {"type": "choice", "instructions": "Which number is two?", "criteria": [str(i) for i in range(12)]},
+    }
+    long_question = {"q": {"type": "choice", "instructions": "word " * 250,
+                           "criteria": {"red": "red " * 100, "blue": "blue " * 100, "other": "other " * 100,
+                                        "four": "four " * 100, "five": "five " * 100}}}
+    cases = [(state, questions), ("The door is red. " * 200, long_question)]
+    observed = []
+    with OpenJevCrossEncoder(args.model, binary=args.binary, gpu_layers=args.gpu_layers) as jev:
+        for state, qs in cases:
+            payload, _ = laya_payload(state, qs)
+            raw = jev.request(payload)
+            observed.append(raw)
+            assert all(abs(sum(r["probabilities"]) - 1) < 1e-6 for r in raw["results"])
+        payload, _ = laya_payload(*cases[0])
+        again = jev.request(payload)
+        compare([r["logits"] for r in again["results"]], [r["logits"] for r in observed[0]["results"]], 1e-5)
+        reversed_payload = {**payload, "questions": list(reversed(payload["questions"]))}
+        reversed_rows = jev.request(reversed_payload)["results"]
+        compare([r["logits"] for r in reversed_rows], [r["logits"] for r in reversed(observed[0]["results"])], 1e-5)
+        for bad in [{"state": "x", "questions": []},
+                    {"state": "x", "questions": [{"type": "bad", "options": ["a", "b"], "instr": "x"}]},
+                    {"state": "x", "questions": [{"type": "choice", "options": ["a"], "instr": "x"}]},
+                    {"state": "x", "questions": [{"type": "choice", "options": ["a"] * 255, "instr": "x"}]}]:
+            try:
+                jev.request(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted invalid Laya request")
+        answers = jev.system_one(*cases[0])["answers"]
+        assert answers["color"]["choice"] == "red"
+        assert answers["refund"]["noul"] > 0.5
+        assert 0 <= answers["urgency"]["score"] <= 2
+    print("PASS Laya typed answers, long-input truncation, repeated/reordered questions and error recovery")
+    if not args.hf_model:
+        return
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoTokenizer
+    sys.path.insert(0, args.hf_model)
+    from rl_common import build_model, build_sequence, collate_items, QTYPES, temp_bucket
+    torch.set_num_threads(4)
+    source = Path(args.hf_model)
+    cfg = json.loads((source / "rl_agent_config.json").read_text())
+    model = build_model(cfg, encoder_dir=str(source / "encoder"))
+    model.load_state_dict(load_file(source / "model.safetensors"), strict=True)
+    model.encoder.config.reference_compile = False
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(source / "tokenizer")
+    max_logit, max_prob, max_act = 0.0, 0.0, 0.0
+    for (state, qs), actual in zip(cases, observed):
+        items = []
+        for question in qs.values():
+            criteria = question.get("criteria")
+            if question["type"] == "choice" and isinstance(criteria, list):
+                criteria = dict.fromkeys(criteria)
+            instr = question["instructions"]
+            q = {"t": question["type"], "ins": instr if isinstance(instr, str) else json.dumps(instr), "crit": criteria}
+            ids, markers = build_sequence(tokenizer, state, q, cfg["max_len"], cfg["head_max_len"])
+            items.append({"ids": ids, "markers": markers, "qtype": QTYPES[q["t"]], "target": [0.] * len(markers),
+                          "label": -1, "episode": 0, "ep_step": 0, "ep_len": 1})
+        b = collate_items([items], tokenizer.pad_token_id)
+        assert actual["evaluated_tokens"] == b["n_tokens"], "tokenization differs from reference"
+        with torch.inference_mode():
+            logits, act = model(b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"])
+        for i, (item, row) in enumerate(zip(items, actual["results"])):
+            k = len(item["markers"])
+            expected = logits[i, :k]
+            max_logit = max(max_logit, max(abs(a - b) for a, b in zip(row["logits"], expected.tolist())))
+            temp = cfg.get("temperature_by_options", {}).get(temp_bucket(item["qtype"], k), cfg["temperature"][item["qtype"]])
+            p = torch.softmax(expected / temp, -1).tolist()
+            max_prob = max(max_prob, max(abs(a - b) for a, b in zip(row["probabilities"], p)))
+            max_act = max(max_act, abs(row["act_probability"] - torch.softmax(act[i], -1)[0].item()))
+    print(f"Laya reference errors: logits={max_logit:.6f}, probabilities={max_prob:.6f}, act={max_act:.6f}")
+    assert max_logit < args.tolerance
+    assert max_prob < 0.01 and max_act < 0.01
+    print("PASS Laya PyTorch parity (all temperature buckets and 512-token input)")
+
+
 def compare(a, b, tolerance):
     assert len(a) == len(b)
     error = max(abs(x - y) for row_a, row_b in zip(a, b) for x, y in zip(row_a, row_b))
@@ -26,7 +117,11 @@ def main():
     parser.add_argument("--mmproj")
     parser.add_argument("--gpu-layers", type=int, default=99)
     parser.add_argument("--tolerance", type=float, default=0.06)
+    parser.add_argument("--laya", action="store_true", help="test Laya; --hf-model points to its reference checkpoint/code")
     args = parser.parse_args()
+    if args.laya:
+        test_laya(args)
+        return
     kwargs = dict(binary=args.binary, gpu_layers=args.gpu_layers, batch_size=64)
     pairs = [("A man is playing a guitar.", "Someone is making music."),
              ("A man is playing a guitar.", "Nobody is making music."),

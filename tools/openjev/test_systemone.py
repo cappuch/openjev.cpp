@@ -95,6 +95,57 @@ class HandleTests(unittest.TestCase):
         self.assertEqual(canonical_id("openjev_0.8b"), "openjev_0.8b")
         self.assertEqual(canonical_id("kev-latest"), "kev_4b")
         self.assertEqual(canonical_id("kev-0.8b"), "kev_0.8b")
+        self.assertEqual(canonical_id("laya-latest"), "laya")
+
+    def test_laya_routing_preserves_reference_format(self):
+        import json
+        encoder = Mock()
+        encoder.request.return_value = {"results": [
+            {"probabilities": [0.2, 0.8], "act_probability": 0.9},
+            {"probabilities": [0.1, 0.2, 0.7], "act_probability": 0.8},
+            {"probabilities": [0.3, 0.7], "act_probability": 0.6},
+        ], "evaluated_tokens": 42}
+        state = {"body": "caf\u00e9", "ok": True}
+        result = handle_request(lambda _: encoder, {
+            "model": "laya", "state": state, "questions": {
+                "c": {"type": "choice", "instructions": "pick", "criteria": {"z": None, "a": "alpha"}},
+                "s": {"type": "score", "instructions": "rate", "criteria": ["low", "mid", "high"]},
+                "n": {"type": "noul", "instructions": "true?"},
+            },
+        })
+        payload = encoder.request.call_args.args[0]
+        self.assertEqual(payload["state"], json.dumps(state, ensure_ascii=False))
+        self.assertEqual(payload["questions"][0]["options"], ["z", "a: alpha"])
+        self.assertEqual(payload["questions"][1]["options"], ["level 0: low", "level 1: mid", "level 2: high"])
+        self.assertEqual(payload["questions"][2]["options"][0], "false: no, the statement does not hold")
+        self.assertEqual(result["answers"]["c"]["choice"], "a")
+        self.assertEqual(result["answers"]["s"]["score"], 1.6)
+        self.assertEqual(result["answers"]["n"]["noul"], 0.7)
+        self.assertEqual(result["answers"]["c"]["rl_agent"]["act_probability"], 0.9)
+        self.assertEqual(result["usage"]["input_tokens"], 42)
+
+    def test_laya_requires_companion(self):
+        import tempfile
+        from pathlib import Path
+        from openjev_server import CATALOG, ModelHub
+        with tempfile.TemporaryDirectory() as root:
+            hub = ModelHub(root, binary="openjev", gpu_layers=0, threads=1, quantize_bin=None)
+            hub.models_dir.mkdir()
+            (hub.models_dir / "laya-f16.gguf").touch()
+            self.assertIsNone(hub.gguf_path(CATALOG["laya"]))
+            (hub.models_dir / "laya.head.gguf").touch()
+            self.assertEqual(hub.gguf_path(CATALOG["laya"]), Path(root) / "models/laya-f16.gguf")
+
+    def test_laya_invalid_schema(self):
+        from openjev import laya_payload
+        for question in [
+            {"type": "choice", "instructions": "x", "criteria": ["only"]},
+            {"type": "score", "instructions": "x", "criteria": "low"},
+            {"type": "noul", "instructions": "x", "criteria": []},
+            {"type": "unknown", "instructions": "x"},
+        ]:
+            with self.assertRaises(ValueError):
+                laya_payload("state", {"q": question})
 
     def test_kev_choice_uses_pointer_options(self):
         def get_encoder(name):
