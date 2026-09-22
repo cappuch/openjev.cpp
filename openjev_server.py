@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from openjev import OpenJevCrossEncoder
+from openjev import OpenJevCrossEncoder, laya_payload, laya_answers
 
 ROOT = Path(__file__).resolve().parent
 HF_REPO = "AlexWortega/openjev"
@@ -41,6 +41,13 @@ IMAGE_SUFFIX = {
 }
 
 CATALOG = {
+    "laya": {
+        "family": "laya",
+        "hub": "convaiinnovations/laya",
+        "f16": "laya-f16.gguf",
+        "q4": "laya-Q4_K_M.gguf",
+        "head": "laya.head.gguf",
+    },
     "openjev_0.8b": {
         "family": "openjev",
         "hf": "qwen3.5-0.8b-nli-v2s-long",
@@ -93,6 +100,7 @@ CATALOG = {
 }
 
 ALIASES = {
+    "laya-latest": "laya",
     LATEST_ID: "openjev_4b",
     KEV_LATEST: "kev_4b",
     "openjev-0.8b": "openjev_0.8b",
@@ -796,6 +804,13 @@ def handle_request(get_encoder, payload):
                 raise RequestError("only one image is supported per request")
             found.append(top_image)
         image = found[0] if found else None
+        if CATALOG[cid]["family"] == "laya":
+            if image:
+                raise RequestError("Laya does not score images")
+            rec, meta = laya_payload(payload["state"], questions)
+            response = jev.request(rec)
+            return {"model": model, "answers": laya_answers(response, meta),
+                    "usage": {"input_tokens": int(response["evaluated_tokens"]), "output_tokens": 0}}
         if CATALOG[cid]["family"] == "kev":
             if image:
                 raise RequestError("kev does not score images; use an openjev model")
@@ -891,7 +906,7 @@ class ModelHub:
             })
         return {
             "models": rows,
-            "aliases": {LATEST_ID: "openjev_4b", KEV_LATEST: "kev_4b"},
+            "aliases": {LATEST_ID: "openjev_4b", KEV_LATEST: "kev_4b", "laya-latest": "laya"},
             "ready": self.ready_ids(),
             "loaded": sorted(loaded),
         }
@@ -925,7 +940,7 @@ class ModelHub:
         path = q4 if q4.is_file() else f16 if f16.is_file() else None
         if path is None:
             return None
-        if spec.get("family") == "kev" and not (self.models_dir / spec["head"]).is_file():
+        if spec.get("head") and not (self.models_dir / spec["head"]).is_file():
             return None
         return path
 
@@ -942,6 +957,8 @@ class ModelHub:
             ready.append(LATEST_ID)
         if self.gguf_path(CATALOG["kev_4b"]):
             ready.append(KEV_LATEST)
+        if self.gguf_path(CATALOG["laya"]):
+            ready.append("laya-latest")
         ready += [name for name, spec in CATALOG.items() if self.gguf_path(spec)]
         return ready
 
@@ -959,6 +976,13 @@ class ModelHub:
         existing = self.gguf_path(spec)
         if existing:
             print(f"openjev: {name} already installed ({existing.name})", flush=True)
+            return
+        if spec.get("family") == "laya":
+            run([sys.executable, str(self.root / "tools" / "openjev" / "convert_laya.py"),
+                 "--hub", spec["hub"], "--out-dir", str(self.models_dir),
+                 "--f16-name", spec["f16"], "--head-name", spec["head"]], cwd=str(self.root))
+            if not self.gguf_path(spec):
+                raise RequestError("install did not produce a complete Laya model", 500)
             return
         if spec.get("family") == "kev":
             convert = [

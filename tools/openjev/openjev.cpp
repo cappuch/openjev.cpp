@@ -1,6 +1,7 @@
 #include "common.h"
 #include "json.h"
 #include "llama.h"
+#include "laya.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -123,7 +125,7 @@ struct options {
 };
 
 static void usage() {
-    std::cout << "openjev.cpp - Qwen3.5 NLI cross-encoder and Kev pointer models\n"
+    std::cout << "openjev.cpp - NLI, Kev pointer models and Laya decisions\n"
                  "Usage: openjev -m MODEL.gguf [options] < requests.jsonl\n"
                  "  --mmproj FILE       vision projector for image requests\n"
                  "  --input FILE        read JSONL from a file instead of stdin\n"
@@ -134,7 +136,8 @@ static void usage() {
                  "  --no-prefix-cache  evaluate each pair independently\n"
                  "  --latents          return final-token hidden states\n"
                  "OpenJev: {\"premise\":\"...\",\"hypotheses\":[\"...\"]}\n"
-                 "Kev: {\"state\":\"...\",\"questions\":[{\"instr\":\"...\",\"options\":[\"...\"]}]}\n";
+                 "Kev: {\"state\":\"...\",\"questions\":[{\"instr\":\"...\",\"options\":[\"...\"]}]}\n"
+                 "Laya: Kev request shape with type (choice, score, noul) on each question\n";
 }
 
 static std::string trim(const std::string & s) {
@@ -158,6 +161,7 @@ class cross_encoder {
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx{nullptr, llama_free};
     std::unique_ptr<mtmd_context, decltype(&mtmd_free)> vision{nullptr, mtmd_free};
     kev_head pointer;
+    std::unique_ptr<laya_head> laya;
     bool kev = false;
     int n_batch = 512, n_seq_max = 5, n_embd = 0;
     uint32_t n_ctx = 0;
@@ -436,8 +440,19 @@ public:
         model.reset(llama_model_load_from_file(opt.model.c_str(), mp));
         if (!model) { throw std::runtime_error("failed to load model"); }
         n_embd = llama_model_n_embd(model.get());
+        char laya_file[1024];
+        const int laya_file_len = llama_model_meta_val_str(model.get(), "laya.head_file", laya_file, sizeof(laya_file));
+        if (laya_file_len >= 0) {
+            if (laya_file_len >= int(sizeof(laya_file)) || std::filesystem::path(laya_file).filename() != laya_file) {
+                throw std::runtime_error("invalid Laya companion filename");
+            }
+            if (opt.latents || !opt.mmproj.empty()) { throw std::runtime_error("Laya does not support --latents or --mmproj"); }
+            const auto path = std::filesystem::path(opt.model).parent_path() / laya_file;
+            laya.reset(new laya_head(path.string(), n_embd, opt.threads));
+            if (opt.context < laya->max_length()) { throw std::runtime_error("Laya requires --ctx-size >= 512"); }
+        }
         const std::string head = kev_head_path(opt.model);
-        kev = pointer.load(head);
+        kev = !laya && pointer.load(head);
         if (kev) {
             if (pointer.d != n_embd) {
                 throw std::runtime_error("kev pointer width does not match the model");
@@ -448,7 +463,7 @@ public:
                 if (ids.size() != 1) { throw std::runtime_error(std::string("missing kev delimiter ") + kev_specials[i]); }
                 kev_tok[i] = ids[0];
             }
-        } else {
+        } else if (!laya) {
             char value[256];
             if (llama_model_meta_val_str(model.get(), "openjev.nli_template", value, sizeof(value)) < 0 ||
                 std::string(value) != nli_template || llama_model_n_cls_out(model.get()) != 3) {
@@ -467,9 +482,14 @@ public:
         cp.n_ubatch = uint32_t(opt.batch);
         cp.n_threads = cp.n_threads_batch = opt.threads;
         cp.embeddings = true;
-        cp.pooling_type = kev ? LLAMA_POOLING_TYPE_NONE
+        cp.pooling_type = (kev || laya) ? LLAMA_POOLING_TYPE_NONE
                               : (opt.latents ? LLAMA_POOLING_TYPE_LAST : LLAMA_POOLING_TYPE_RANK);
         cp.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+        if (laya) {
+            cp.n_ctx = cp.n_batch = cp.n_ubatch = laya->max_length();
+            cp.n_seq_max = 1;
+            cp.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+        }
         ctx.reset(llama_init_from_model(model.get(), cp));
         if (!ctx) { throw std::runtime_error("failed to create context"); }
         n_ctx = llama_n_ctx(ctx.get());
@@ -488,6 +508,11 @@ public:
         const auto start = std::chrono::steady_clock::now();
         evaluated_tokens = 0;
         if (!request.is_object()) { throw std::runtime_error("request must be an object"); }
+        if (laya) {
+            json out = laya->predict(ctx.get(), model.get(), request);
+            out["elapsed_ms"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            return out;
+        }
         const bool kev_req = request.contains("questions") && request.at("questions").is_array();
         if (kev) {
             if (!kev_req) { throw std::runtime_error("kev GGUF expects {state, questions:[{instr, options}]}"); }

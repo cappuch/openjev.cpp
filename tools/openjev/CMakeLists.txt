@@ -1,4 +1,4 @@
-add_executable(openjev openjev.cpp)
+add_executable(openjev openjev.cpp laya.cpp)
 target_link_libraries(openjev PRIVATE llama-common mtmd Threads::Threads)
 target_compile_features(openjev PRIVATE cxx_std_17)
 if (LLAMA_TOOLS_INSTALL)
