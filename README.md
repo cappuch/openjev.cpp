@@ -26,6 +26,16 @@ Three short hypotheses on 0.8B F16 dropped from 387 ms (one decode per suffix) t
 
 `--no-prefix-cache` is the independent-pair baseline. Numbers above exclude model load; the Python client keeps the process alive.
 
+Laya (English ModernBERT-large plus the decision head, F16, Apple M5, 4 threads) against the PyTorch reference `RLAgent.system_one`. OpenJev is the persistent Python client. Medians of 8 runs after 2 warmups; model load excluded. CPU is built with libomp 23.1.1.
+
+| Case | OpenJev CPU | PyTorch CPU | OpenJev Metal | PyTorch MPS |
+| --- | ---: | ---: | ---: | ---: |
+| Short, 1 question (67 tokens) | 356 ms | 154 ms | 37 ms | 72 ms |
+| 512 tokens, 1 question | 1.17 s | 734 ms | 152 ms | 325 ms |
+| Short, 8 questions (536 tokens) | 1.41 s | 724 ms | 165 ms | 336 ms |
+
+Metal is about 2x PyTorch MPS on these requests. CPU is still slower than PyTorch CPU.
+
 ---
 
 # llama.cpp (upstream)
