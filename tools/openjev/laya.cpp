@@ -230,6 +230,7 @@ json laya_head::predict(llama_context * ctx, const llama_model * model, const js
         tokens.resize(std::min(tokens.size(), size_t(max_length())));
         if (markers.back() >= int(tokens.size())) { throw std::runtime_error("Laya options do not fit in token budget"); }
         auto batch = llama_batch_init(tokens.size(), 0, 1);
+        common_batch_clear(batch);
         for (size_t i = 0; i < tokens.size(); ++i) { common_batch_add(batch, tokens[i], i, {0}, true); }
         const int status = llama_encode(ctx, batch);
         llama_batch_free(batch);

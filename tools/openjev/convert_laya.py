@@ -48,7 +48,8 @@ def convert(source, out_dir, encoder_name="laya-f16.gguf", head_name="laya.head.
     cfg = json.loads((source / "rl_agent_config.json").read_text())
     hparams = json.loads((source / "encoder" / "config.json").read_text())
     if (cfg.get("encoder") != "answerdotai/ModernBERT-large" or
-            hparams.get("model_type") != "modernbert" or cfg.get("head_layers") != 2):
+            hparams.get("model_type") != "modernbert" or hparams.get("hidden_size") != 1024 or
+            cfg.get("head_layers") != 2 or cfg.get("max_len") != 512 or cfg.get("head_max_len") != 192):
         raise ValueError("only the English ModernBERT-large Laya checkpoint is supported")
     if not 1 <= cfg["head_max_len"] < cfg["max_len"] <= hparams["max_position_embeddings"]:
         raise ValueError("invalid Laya token budgets")
@@ -68,7 +69,7 @@ def convert(source, out_dir, encoder_name="laya-f16.gguf", head_name="laya.head.
     if encoder_path.exists() or head_path.exists():
         raise FileExistsError("output exists; use a new output directory or filenames")
     encoder_tmp, head_tmp = encoder_path.with_suffix(".gguf.tmp"), head_path.with_suffix(".gguf.tmp")
-    model = LayaEncoder(source, gguf.LlamaFileType.MOSTLY_F16, encoder_tmp, hparams=hparams)
+    model = LayaEncoder(source, gguf.LlamaFileType.MOSTLY_F16, encoder_tmp, hparams=hparams, model_name="Laya English")
     model.head_name = head_name
     writer = gguf.GGUFWriter(head_tmp, "laya")
     writer.add_string("laya.config", json.dumps(cfg))

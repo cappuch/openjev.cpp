@@ -2,6 +2,8 @@
 
 The English root checkpoint of `convaiinnovations/laya` is supported by the `openjev` executable, Python client and `/v1/systemone` API. It uses the existing ModernBERT encoder and a companion GGUF containing the two decision layers, option scorer, question-type embeddings and act/escalate head.
 
+Reference: [model and inference code](https://huggingface.co/convaiinnovations/laya/tree/main).
+
 ## Build and convert
 
 Use the Python environment with the repository's conversion dependencies (`torch`, `transformers`, `safetensors`, `huggingface_hub` and `gguf-py`).
