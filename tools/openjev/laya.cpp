@@ -149,7 +149,8 @@ laya_head::laya_head(const std::string & path, int n_embd, int threads) : data(n
     }
     auto temps = cfg.value("temperature", std::vector<float>{1, 1, 1});
     if (temps.size() != 3) { throw std::runtime_error("invalid Laya temperatures"); }
-    for (const auto & t : cfg.value("temperature_by_options", json::object()).items()) { temps.push_back(t.value().get<float>()); }
+    const auto buckets = cfg.value("temperature_by_options", json::object());
+    for (const auto & t : buckets.items()) { temps.push_back(t.value().get<float>()); }
     for (float t : temps) {
         if (!std::isfinite(t) || t <= 0) { throw std::runtime_error("invalid Laya temperature"); }
     }
