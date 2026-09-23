@@ -224,6 +224,13 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
+# F16 GEMM microbench. Links ggml only, so it builds with the library.
+if (TARGET ggml)
+    add_executable(llama-amx-bf16-bench examples/amx-bf16/bench.cpp)
+    target_link_libraries(llama-amx-bf16-bench PRIVATE ggml)
+    target_compile_features(llama-amx-bf16-bench PRIVATE cxx_std_17)
+endif()
+
 #
 # build the library
 #
