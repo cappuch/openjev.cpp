@@ -114,9 +114,13 @@ class OpenJevCrossEncoder:
             watchdog.start()
             try:
                 try:
-                    self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                    self._process.stdin.flush()
-                    line = self._process.stdout.readline()
+                    stdin = self._process.stdin
+                    stdout = self._process.stdout
+                    if stdin is None or stdout is None:
+                        raise RuntimeError("openjev pipes are not open")
+                    stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    stdin.flush()
+                    line = stdout.readline()
                 except BrokenPipeError as exc:
                     if not expired.is_set():
                         raise RuntimeError("openjev closed its input; see stderr") from exc
@@ -189,7 +193,9 @@ class OpenJevCrossEncoder:
                 except subprocess.TimeoutExpired:
                     self._process.kill()
                     self._process.wait()
-            self._process.stdout.close()
+            stdout = self._process.stdout
+            if stdout is not None:
+                stdout.close()
 
     def __enter__(self):
         return self

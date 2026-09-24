@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-wasm.yml',
       '**/CMakeLists.txt',
@@ -98,7 +98,7 @@ jobs:
           time cmake --build build-wasm --config Release --target test-backend-ops -j $(nproc)
 
       - name: ccache-buckets-save
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: ./.github/actions/ccache-buckets
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}

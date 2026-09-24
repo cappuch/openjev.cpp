@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-openvino.yml',
       '**/CMakeLists.txt',
@@ -37,6 +37,8 @@ env:
 
 jobs:
   ubuntu-24-openvino:
+    # No Intel OpenVINO self-hosted runner on this fork. Skip so the job does not stay queued.
+    if: false
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:
@@ -110,7 +112,7 @@ jobs:
           key: openvino-windows-2022
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Setup Cache
         uses: actions/cache@v5
@@ -175,4 +177,4 @@ jobs:
           key: openvino-windows-2022
           older: 5m
           min: 1
-          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}

@@ -1,3 +1,7 @@
+# Disabled on cappuch/openjev.cpp.
+# Needs ggml-org self-hosted runners, Hugging Face job runners, or hardware this fork does not have.
+# Rename to ui-self-hosted.yml to restore.
+
 name: UI (self-hosted)
 
 # these are the same as ui.yml, but with self-hosted runners
@@ -13,7 +17,7 @@ on:
         type: string
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/ui-self-hosted.yml',
       '.github/workflows/ui-build-self-hosted.yml',

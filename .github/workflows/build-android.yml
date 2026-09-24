@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - master
+      - main
     paths:
       - '.github/workflows/build-android.yml'
       - '**/CMakeLists.txt'
@@ -114,7 +114,7 @@ jobs:
       #  with:
       #    key: android-ubuntu-arm64
       #    evict-old-files: 1d
-      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Set up JDK
         uses: actions/setup-java@v5

@@ -1,12 +1,16 @@
-name: CI (self-hosted CPU backend)
+# Disabled on cappuch/openjev.cpp.
+# Needs ggml-org self-hosted runners, Hugging Face job runners, or hardware this fork does not have.
+# Rename to ci-self-hosted-kleidiai.yml to restore.
+
+name: CI (self-hosted KleidiAI backend)
 
 on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
-      '.github/workflows/ci-self-hosted-cpu.yml',
+      '.github/workflows/ci-self-hosted-kleidiai.yml',
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
@@ -19,7 +23,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
-      '.github/workflows/ci-self-hosted-cpu.yml',
+      '.github/workflows/ci-self-hosted-kleidiai.yml',
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
@@ -41,20 +45,7 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64]
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  cpu-arm64-high-perf-graviton4:
+  cpu-arm64-graviton4-kleidiai:
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:
@@ -92,21 +83,7 @@ jobs:
         id: ggml-ci
         run: |
           LLAMA_ARG_THREADS=$(nproc) \
-          GG_BUILD_HIGH_PERF=1 \
-          GG_BUILD_NO_BF16=1 \
+          GG_BUILD_KLEIDIAI=1 \
           GG_BUILD_EXTRA_TESTS_0=1 \
+          GG_BUILD_HIGH_PERF=1 \
           bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  # TODO: provision AMX-compatible machine
-  #cpu-amx:
-  #  runs-on: [self-hosted, Linux, CPU, AMX]
-
-  #  steps:
-  #    - name: Clone
-  #      id: checkout
-  #      uses: actions/checkout@v6
-
-  #    - name: Test
-  #      id: ggml-ci
-  #      run: |
-  #        bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp

@@ -22,6 +22,7 @@ from conversion.bert import ModernBertModel
 
 class LayaEncoder(ModernBertModel):
     model_arch = gguf.MODEL_ARCH.MODERN_BERT
+    head_name: str
 
     @classmethod
     def filter_tensors(cls, item):

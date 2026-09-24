@@ -1,3 +1,7 @@
+# Disabled on cappuch/openjev.cpp.
+# Runs on a self-hosted opencode runner this fork does not have.
+# Rename to ai-issues.yml to restore.
+
 name: AI review (issues)
 
 on:

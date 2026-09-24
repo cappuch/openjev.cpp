@@ -1,3 +1,7 @@
+# Disabled on cappuch/openjev.cpp.
+# Needs ggml-org self-hosted runners, Hugging Face job runners, or hardware this fork does not have.
+# Rename to server-sanitize.yml to restore.
+
 name: Server (sanitize)
 
 on:
@@ -13,7 +17,7 @@ on:
         type: boolean
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/server-sanitize.yml',
       '**/CMakeLists.txt',
@@ -94,7 +98,7 @@ jobs:
           cmake --build build --config ${{ matrix.build_type }} -j $(nproc) --target llama-server
 
       - name: ccache-buckets-save
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: ./.github/actions/ccache-buckets
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}

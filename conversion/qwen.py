@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
@@ -648,6 +649,11 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
 class _OpenJevClassifierMixin:
     supports_mtp_export = False
+    no_mtp = True
+    dir_model: Path
+    gguf_writer: gguf.GGUFWriter
+    hparams: dict[str, Any]
+    openjev_config: dict[str, Any]
 
     def __init__(self, *args, **kwargs):
         # Sequence classifiers retain the backbone config but have no MTP layers.
@@ -656,7 +662,7 @@ class _OpenJevClassifierMixin:
         self.openjev_config = ModelBase.load_hparams(self.dir_model, False)
 
     def set_gguf_parameters(self):
-        super().set_gguf_parameters()
+        super().set_gguf_parameters()  # ty: ignore[unresolved-attribute]
         labels = {str(k): v for k, v in self.openjev_config.get("id2label", {}).items()}
         if labels != {"0": "contradiction", "1": "entailment", "2": "neutral"}:
             raise ValueError("openjev requires labels [contradiction, entailment, neutral]")
@@ -676,12 +682,12 @@ class _OpenJevClassifierMixin:
             return
         if name.startswith("score."):
             raise ValueError(f"Unsupported openjev classifier tensor: {name}")
-        yield from super().modify_tensors(data_torch, name, bid)
+        yield from super().modify_tensors(data_torch, name, bid)  # ty: ignore[unresolved-attribute]
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         if new_name == "cls.output.weight":
             return gguf.GGMLQuantizationType.F32
-        return super().tensor_force_quant(name, new_name, bid, n_dims)
+        return super().tensor_force_quant(name, new_name, bid, n_dims)  # ty: ignore[unresolved-attribute]
 
 
 @ModelBase.register("Qwen3_5ForSequenceClassification")

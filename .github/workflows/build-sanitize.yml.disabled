@@ -1,10 +1,14 @@
+# Disabled on cappuch/openjev.cpp.
+# Needs a self-hosted Linux runner this fork does not have.
+# Rename to build-sanitize.yml to restore.
+
 name: CI (sanitize)
 
 on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-sanitize.yml',
       '**/CMakeLists.txt',
@@ -61,7 +65,7 @@ jobs:
       #     key: ctest-${{ matrix.sanitizer }}-ubuntu-24.04
       #     variant: ccache
       #     evict-old-files: 1d
-      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # with UNDEFINED sanitizer, we have to build in Debug to avoid GCC 13 false-positive warnings
       - name: Build (undefined)

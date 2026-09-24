@@ -1,10 +1,14 @@
+# Disabled on cappuch/openjev.cpp.
+# Uses ubuntu-24.04-s390x and ubuntu-24.04-ppc64le. Those larger runners are not enabled here, so jobs stay queued.
+# Rename to build-ibm.yml to restore.
+
 name: CI (ibm)
 
 on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-ibm.yml',
       '**/CMakeLists.txt',

@@ -72,7 +72,7 @@ def test_laya(args):
     from safetensors.torch import load_file
     from transformers import AutoTokenizer
     sys.path.insert(0, args.hf_model)
-    from rl_common import build_model, build_sequence, collate_items, QTYPES, temp_bucket
+    from rl_common import build_model, build_sequence, collate_items, QTYPES, temp_bucket  # ty: ignore[unresolved-import]
     torch.set_num_threads(4)
     source = Path(args.hf_model)
     cfg = json.loads((source / "rl_agent_config.json").read_text())
@@ -98,7 +98,10 @@ def test_laya(args):
         with torch.inference_mode():
             logits, act = model(b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"])
         for i, (item, row) in enumerate(zip(items, actual["results"])):
-            k = len(item["markers"])
+            markers = item["markers"]
+            if not isinstance(markers, list):
+                raise AssertionError("Laya markers are not a list")
+            k = len(markers)
             expected = logits[i, :k]
             max_logit = max(max_logit, max(abs(a - b) for a, b in zip(row["logits"], expected.tolist())))
             temp = cfg.get("temperature_by_options", {}).get(temp_bucket(item["qtype"], k), cfg["temperature"][item["qtype"]])
