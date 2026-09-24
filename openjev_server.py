@@ -18,6 +18,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
+from typing import Any, TypedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -141,11 +142,46 @@ def verify_password(password, salt, digest):
     return hmac.compare_digest(_pbkdf2(password, salt), digest)
 
 
+class AdminAccount(TypedDict):
+    username: str
+    salt: str
+    hash: str
+    iters: int
+
+
+class ApiKey(TypedDict):
+    id: str
+    name: str
+    prefix: str
+    hash: str
+    created: int
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    elapsed_ms: float
+    last_used: int | None
+
+
+class UsageTotals(TypedDict):
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    elapsed_ms: float
+
+
+class AdminData(TypedDict):
+    admin: AdminAccount | None
+    secret: str
+    keys: list[ApiKey]
+    samples: list[Any]
+    totals: UsageTotals
+
+
 class AdminStore:
     def __init__(self, path):
         self.path = Path(path)
         self._lock = threading.Lock()
-        self._data = {
+        self._data: AdminData = {
             "admin": None,
             "secret": secrets.token_hex(32),
             "keys": [],
@@ -241,7 +277,7 @@ class AdminStore:
         if len(name) > 64:
             raise RequestError("key name is too long")
         raw = "oj_" + secrets.token_urlsafe(24)
-        record = {
+        record: ApiKey = {
             "id": "k_" + secrets.token_hex(8),
             "name": name,
             "prefix": raw[:10],
@@ -1254,6 +1290,7 @@ def make_handler(hub, store):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        inference_executor = executor
 
         def log_message(self, format, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
@@ -1444,8 +1481,9 @@ def main():
     hub = ModelHub(ROOT, binary=binary, gpu_layers=args.gpu_layers, threads=args.threads,
                    quantize_bin=str(ROOT / "build" / "bin" / "llama-quantize"),
                    inference_timeout=args.inference_timeout)
+    handler = make_handler(hub, store)
     try:
-        server = ThreadingHTTPServer((args.host, args.port), make_handler(hub, store))
+        server = ThreadingHTTPServer((args.host, args.port), handler)
         print(f"openjev admin http://{args.host}:{args.port}/", flush=True)
         print(f"openjev systemone http://{args.host}:{args.port}/v1/systemone", flush=True)
         if store.needs_setup():
@@ -1457,7 +1495,7 @@ def main():
             pass
         finally:
             server.server_close()
-            executor.shutdown(wait=True, cancel_futures=True)
+            handler.inference_executor.shutdown(wait=True, cancel_futures=True)
     finally:
         hub.close()
 

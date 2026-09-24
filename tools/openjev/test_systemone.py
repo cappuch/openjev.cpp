@@ -6,6 +6,12 @@ from unittest.mock import Mock
 from openjev_server import RequestError, canonical_id, flatten, handle_request, softmax
 
 
+def _http_connection(server):
+    import http.client
+    host, port = server.server_address[:2]
+    return http.client.HTTPConnection(str(host), int(port), timeout=3)
+
+
 class FlattenTests(unittest.TestCase):
     def test_nested_entry(self):
         text = flatten({"hp": 3, "inv": ["wood", "stone"], "note": "craft pickaxe"})
@@ -304,7 +310,6 @@ class HandleTests(unittest.TestCase):
 
 class InferenceLifecycleTests(unittest.TestCase):
     def test_async_job_returns_before_inference_finishes(self):
-        import http.client
         import json
         import threading
         import time
@@ -323,7 +328,7 @@ class InferenceLifecycleTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(hub, store))
         runner = threading.Thread(target=server.serve_forever); runner.start()
         def request(path, body="{}"):
-            conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+            conn = _http_connection(server)
             conn.request("POST", path, body=body, headers={"Authorization": "Bearer key", "Content-Type": "application/json"})
             result = conn.getresponse(); data = json.loads(result.read()); conn.close()
             return result.status, data
@@ -335,7 +340,7 @@ class InferenceLifecycleTests(unittest.TestCase):
                 self.assertTrue(entered.wait(2))
                 release.set()
                 for _ in range(30):
-                    conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+                    conn = _http_connection(server)
                     conn.request("GET", "/v1/jobs/" + job["id"])
                     result = conn.getresponse(); data = json.loads(result.read()); conn.close()
                     if data["status"] == "done": break
@@ -363,7 +368,6 @@ class InferenceLifecycleTests(unittest.TestCase):
             encoder.close()
 
     def test_busy_requests_fail_fast_and_health_stays_responsive(self):
-        import http.client
         import json
         import threading
         from http.server import ThreadingHTTPServer
@@ -384,7 +388,7 @@ class InferenceLifecycleTests(unittest.TestCase):
         runner = threading.Thread(target=server.serve_forever)
         runner.start()
         def request(path, method="POST"):
-            conn = http.client.HTTPConnection(*server.server_address, timeout=3)
+            conn = _http_connection(server)
             try:
                 conn.request(method, path, body="{}" if method == "POST" else None)
                 res = conn.getresponse()

@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-sycl.yml',
       '**/CMakeLists.txt',
@@ -105,7 +105,7 @@ jobs:
           time cmake --build build --config Release -j $(nproc)
 
       - name: ccache-buckets-save
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: ./.github/actions/ccache-buckets
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
@@ -152,7 +152,7 @@ jobs:
           key: sycl-windows-latest
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # TODO: add ssl support ; we will also need to modify win-build-sycl.bat to accept user-specified args
 
@@ -168,4 +168,4 @@ jobs:
           key: sycl-windows-latest
           older: 5m
           min: 1
-          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}

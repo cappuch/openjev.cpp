@@ -1,3 +1,7 @@
+# Disabled on cappuch/openjev.cpp.
+# Needs ggml-org self-hosted runners, Hugging Face job runners, or hardware this fork does not have.
+# Rename to ui-build-self-hosted.yml to restore.
+
 name: UI Build (self-hosted)
 
 on:

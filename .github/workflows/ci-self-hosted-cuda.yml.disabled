@@ -1,10 +1,14 @@
+# Disabled on cappuch/openjev.cpp.
+# Needs ggml-org self-hosted runners, Hugging Face job runners, or hardware this fork does not have.
+# Rename to ci-self-hosted-cuda.yml to restore.
+
 name: CI (self-hosted CUDA backend)
 
 on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/ci-self-hosted-cuda.yml',
       'ci/run.sh',
@@ -77,7 +81,7 @@ jobs:
           GG_BUILD_CUDA=1 CUDACXX=/usr/local/cuda/bin/nvcc bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
       - name: ccache-buckets-save
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: ./.github/actions/ccache-buckets
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}

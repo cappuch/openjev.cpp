@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-opencl.yml',
       '**/CMakeLists.txt',
@@ -49,7 +49,7 @@ jobs:
           key: opencl-windows-2025-x64
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install Ninja
         id: install_ninja
@@ -89,4 +89,4 @@ jobs:
           key: opencl-windows-2025-x64
           older: 5m
           min: 1
-          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}

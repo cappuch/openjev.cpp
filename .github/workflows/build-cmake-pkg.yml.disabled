@@ -1,3 +1,7 @@
+# Disabled on cappuch/openjev.cpp.
+# Needs a self-hosted Linux runner this fork does not have.
+# build-cpu.yml no longer calls this workflow. Rename to build-cmake-pkg.yml to restore.
+
 name: Build relocatable cmake package
 on:
   workflow_dispatch:

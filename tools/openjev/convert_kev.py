@@ -43,7 +43,7 @@ def main():
 
     import torch
     from huggingface_hub import snapshot_download
-    from peft import PeftModel
+    from peft import PeftModel  # ty: ignore[unresolved-import]
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     out_dir = args.out_dir

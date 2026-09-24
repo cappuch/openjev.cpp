@@ -26,7 +26,7 @@ on:
 
   push:
     branches:
-      - master
+      - main
     paths: ['llama.cpp', 'ggml.c', 'ggml-backend.cpp', 'ggml-quants.c', '**/*.cu', 'tools/server/*.h*', 'tools/server/*.cpp']
   pull_request_target:
     types: [opened, synchronize, reopened]
